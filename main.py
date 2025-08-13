@@ -1,53 +1,56 @@
-import os, time, io, csv, json, requests, sqlite3, datetime, re, hashlib, smtplib, uuid
+import os, time, io, csv, json, requests, sqlite3, datetime, re, hashlib, smtplib, uuid, secrets
 from typing import List, Dict, Optional, Tuple
 from email.message import EmailMessage
 from urllib.parse import urlparse, parse_qs
 
-from fastapi import FastAPI, HTTPException, Query, Header, Request, Response, Form
+from fastapi import FastAPI, HTTPException, Query, Header, Request, Response, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response as FastAPIResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response as FastAPIResponse, PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from uvicorn import run as uvicorn_run
 
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.6.1",
+    version="0.7.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
+        {"name": "Admin", "description": "Key management"},
     ],
 )
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
+app.add_middleware(GZipMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Config ----------
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "true").lower() in ("1", "true", "yes")
 KEYS_PATH = os.getenv("KEYS_PATH", "keys.json")
 USAGE_DB = os.getenv("USAGE_DB_PATH", "usage.db")
-
-# Key request handling
-KEY_REQUEST_MODE = os.getenv("KEY_REQUEST_MODE", "file")  # 'file' or 'email'
+KEY_REQUEST_MODE = os.getenv("KEY_REQUEST_MODE", "file")
 KEY_REQUEST_FILE = os.getenv("KEY_REQUEST_FILE", "key_requests.jsonl")
 KEY_AUTO_ISSUE = os.getenv("KEY_AUTO_ISSUE", "true").lower() in ("1", "true", "yes")
 
-# Email settings (only if KEY_REQUEST_MODE='email')
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 KEY_REQUEST_TO = os.getenv("KEY_REQUEST_TO", SMTP_USER)
 
-# Plans & limits
+ADMIN_USER = os.getenv("ADMIN_USER") or "admin"
+ADMIN_PASS = os.getenv("ADMIN_PASS") or "change-me"
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "90"))
+
 PLANS = {
     "free": {"price": 0, "monthly_limit": 200, "label": "Free"},
     "pro":  {"price": 9, "monthly_limit": 5000, "label": "Pro"},
     "plus": {"price": 19, "monthly_limit": 25000, "label": "Plus"},
 }
 
-# ---------- In-memory CSV cache ----------
-_cache: Dict[str, Dict] = {}  # key -> {"ts": float, "rows": List[dict], "raw_sha": str}
+# ---------- In-memory data ----------
+_cache: Dict[str, Dict] = {}    # csv_url -> {"ts": float, "rows": List[dict], "raw_sha": str}
+_rl: Dict[str, List[float]] = {}  # rate limit buckets: key/ip -> [timestamps]
 
 # ---------- Keys ----------
 def load_keys() -> Dict[str, Dict]:
@@ -68,7 +71,7 @@ def save_keys(keys: Dict[str, Dict]):
 
 KEYS = load_keys()
 
-def issue_key(plan: str) -> str:
+def issue_key(plan: str, limit_override: Optional[int] = None) -> str:
     plan = plan.lower()
     if plan not in PLANS:
         plan = "free"
@@ -76,7 +79,7 @@ def issue_key(plan: str) -> str:
         k = uuid.uuid4().hex.upper()
         if k not in KEYS:
             break
-    KEYS[k] = {"plan": plan, "monthly_limit": PLANS[plan]["monthly_limit"]}
+    KEYS[k] = {"plan": plan, "monthly_limit": int(limit_override or PLANS[plan]["monthly_limit"])}
     save_keys(KEYS)
     return k
 
@@ -126,16 +129,14 @@ def increment_usage(api_key: str, amount: int = 1) -> int:
     con.close()
     return int(row[0]) if row else 0
 
-# ---------- Filtering / sorting helpers ----------
+# ---------- Filtering / sorting ----------
 _num_clean_re = re.compile(r"[,\s]")
 _filter_re = re.compile(r"""^\s*(?P<col>[^:~^\$><=!]+?)\s*(?P<op>>=|<=|!=|>|<|~|\^|\$|:)\s*(?P<val>.+?)\s*$""")
 
 def _to_number(s: Optional[str]) -> Optional[float]:
-    if s is None:
-        return None
+    if s is None: return None
     t = str(s).strip()
-    if not t:
-        return None
+    if not t: return None
     if t.startswith("$"): t = t[1:]
     pct = t.endswith("%")
     if pct: t = t[:-1]
@@ -148,15 +149,8 @@ def _to_number(s: Optional[str]) -> Optional[float]:
 
 def _match_filter(row_val: Optional[str], op: str, val: str) -> bool:
     if op in (":", "!=", "~", "^", "$"):
-        a = (row_val or "").strip().lower()
-        b = val.strip().lower()
-        return {
-            ":":  a == b,
-            "!=": a != b,
-            "~":  b in a,
-            "^":  a.startswith(b),
-            "$":  a.endswith(b),
-        }[op]
+        a = (row_val or "").strip().lower(); b = val.strip().lower()
+        return {":": a==b, "!=": a!=b, "~": b in a, "^": a.startswith(b), "$": a.endswith(b)}[op]
     if op in (">", "<", ">=", "<="):
         x = _to_number(row_val); y = _to_number(val)
         if x is None or y is None: return False
@@ -210,7 +204,6 @@ def fetch_csv_rows(csv_url: str, bypass_cache: bool = False) -> Tuple[List[Dict[
         raise HTTPException(status_code=413, detail="CSV too large (>5MB)")
 
     content_text = content_bytes.decode("utf-8", errors="replace")
-
     try:
         sample = content_text[:2048]
         dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
@@ -267,6 +260,21 @@ def require_and_track_key(api_key_header: Optional[str], api_key_query: Optional
         raise HTTPException(status_code=429, detail=f"Monthly limit reached ({used_after}/{limit}). Upgrade your plan.")
     return api_key
 
+# ---------- Rate limit helper ----------
+def rate_limit_ok(bucket: str) -> bool:
+    now = time.time()
+    window = 60.0
+    lim = RATE_LIMIT_PER_MIN
+    arr = _rl.get(bucket, [])
+    # drop old
+    arr = [t for t in arr if now - t < window]
+    if len(arr) >= lim:
+        _rl[bucket] = arr
+        return False
+    arr.append(now)
+    _rl[bucket] = arr
+    return True
+
 # ---------- Logo / Favicon ----------
 LOGO_SVG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'>
   <defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
@@ -307,15 +315,20 @@ def _html_head(title: str) -> str:
   button{{background:var(--accent);border:none;color:#04122d;font-weight:700;cursor:pointer}}
   .grid{{display:grid;gap:12px}} @media(min-width:820px){{.grid{{grid-template-columns:1.5fr 1fr}}}}
   pre{{background:#0a0f24;border:1px solid #26335f;border-radius:12px;padding:14px;overflow:auto}}
-  small{{color:var(--muted)}} .row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+  small{{color:#muted}} .row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
   .hint{{font-size:13px;color:#aab8e6}} .pill{{display:inline-block;background:#0a1638;border:1px solid #24336a;border-radius:99px;padding:4px 8px;margin-right:6px;color:#a9b8ee}}
   a{{color:#9cc2ff}} #status{{margin:8px 0 0 0;font-size:13px;color:#aab8e6}} code{{background:#0a0f24;border:1px solid #26335f;border-radius:6px;padding:0 4px}}
   .pricegrid{{display:grid;gap:12px}} @media(min-width:720px){{.pricegrid{{grid-template-columns:repeat(3,1fr)}}}}
   .plan{{background:#0e1630;border:1px solid #233366;border-radius:14px;padding:16px}}
   .plan h3{{margin:0 0 6px}} .cta{{margin-top:8px}}
+  table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1px solid #233366;text-align:left}}
+  .btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #233366;background:#0e1630;color:#eaf0ff;text-decoration:none}}
 </style>"""
 
-# ---------- Pages ----------
+# ---------- Public pages (same as before) ----------
+# ... (Home, Pricing, Request forms unchanged from v0.6.1 for brevity)
+# I’ll inline the same HTML from your 0.6.1 here:
+
 HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — CSV → JSON API")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo"/><div><strong>SheetsJSON</strong><br/><small class="hint">Google Sheets → JSON API</small></div></header>
@@ -376,8 +389,7 @@ $("go").addEventListener("click", runFetch); $("usage").addEventListener("click"
 </script></body></html>
 """
 
-def fmt_price(n: int) -> str:
-    return "$0" if n == 0 else f"${n}/mo"
+def fmt_price(n: int) -> str: return "$0" if n == 0 else f"${n}/mo"
 
 PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Pricing & Docs")}</head>
 <body><div class="wrap">
@@ -442,16 +454,13 @@ REQUEST_KEY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJ
 """
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return HTMLResponse(HOME_HTML)
+def home(): return HTMLResponse(HOME_HTML)
 
 @app.get("/pricing", response_class=HTMLResponse)
-def pricing():
-    return HTMLResponse(PRICING_HTML)
+def pricing(): return HTMLResponse(PRICING_HTML)
 
 @app.get("/request-key", response_class=HTMLResponse)
-def request_key_form():
-    return HTMLResponse(REQUEST_KEY_HTML)
+def request_key_form(): return HTMLResponse(REQUEST_KEY_HTML)
 
 @app.post("/request-key")
 async def request_key_submit(
@@ -460,11 +469,10 @@ async def request_key_submit(
     email: str = Form(...),
     plan: str = Form("free"),
     use_case: str = Form(""),
-    company: str = Form("")  # honeypot
+    company: str = Form("")
 ):
     if company.strip():
         return HTMLResponse("<h3>Thanks!</h3>", status_code=200)
-
     payload = {
         "ts": datetime.datetime.utcnow().isoformat() + "Z",
         "name": name.strip()[:200],
@@ -475,8 +483,7 @@ async def request_key_submit(
         "ua": request.headers.get("user-agent", ""),
         "mode": KEY_REQUEST_MODE,
     }
-
-    # store request (file or email)
+    # store request
     if KEY_REQUEST_MODE == "email" and SMTP_HOST and SMTP_USER and SMTP_PASS:
         try:
             msg = EmailMessage()
@@ -491,29 +498,24 @@ async def request_key_submit(
     else:
         with open(KEY_REQUEST_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
-
     # auto-issue key
     key_text = issue_key(payload["plan"]) if KEY_AUTO_ISSUE else None
-
-    # thank-you page (shows key if issued)
     key_html = (f"<p>Your <strong>{PLANS[payload['plan']]['label']}</strong> API key:</p>"
                 f"<pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{key_text}</pre>"
-                f"<p class='hint'>Limit: {PLANS[payload['plan']]['monthly_limit']} requests / month. "
+                f"<p class='hint'>Limit: {PLANS[payload['plan']]['monthly_limit']} req/mo. "
                 f"Use header <code>x-api-key</code> or query <code>?key=</code>.</p>") if key_text else "<p>We’ll email your key shortly.</p>"
-
-    return HTMLResponse(f"""
-<!doctype html><meta charset="utf-8"><title>Thanks</title>
-<body style='font-family:system-ui;padding:2rem;background:#0b1020;color:#eef2ff'>
-  <h2>Thanks — your request was received.</h2>
-  {key_html}
-  <p><a style='color:#9cc2ff' href='/'>← Back to Home</a></p>
-</body>""", status_code=200)
+    return HTMLResponse(f"<!doctype html><meta charset='utf-8'><title>Thanks</title><body style='font-family:system-ui;padding:2rem;background:#0b1020;color:#eef2ff'><h2>Thanks — your request was received.</h2>{key_html}<p><a style='color:#9cc2ff' href='/'>← Back to Home</a></p></body>", status_code=200)
 
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.6.1"}
+def healthz(): return {"ok": True, "version": "0.7.0"}
 
-# ---------- API ----------
+# ---------- Rate-limited API ----------
+def rl_or_429(request: Request, api_key: Optional[str]):
+    ident = api_key or (request.client.host if request.client else "unknown")
+    if not rate_limit_ok(ident):
+        raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
+
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
 def fetch(
     request: Request, response: Response,
@@ -527,22 +529,16 @@ def fetch(
     api_key_header: Optional[str] = Header(None, alias="x-api-key", description="Your API key", example="FREE_EXAMPLE_KEY_123"),
     key: Optional[str] = Query(None, description="API key (alt)", example="FREE_EXAMPLE_KEY_123"),
 ):
-    # auth + metering
     api_key = require_and_track_key(api_key_header, key)
-    # safety checks
+    rl_or_429(request, api_key)
     validate_csv_url(csv_url)
-    # fetch + transform
     rows, raw_sha = fetch_csv_rows(csv_url, bypass_cache=bool(cache_bypass))
     data = apply_filters(rows, select=select, filters=filter, order=order, limit=limit, offset=offset)
-
-    # ETag handling
     qnorm = json.dumps({"select": select, "filter": filter, "order": order, "limit": limit, "offset": offset}, sort_keys=True, separators=(",",":"))
     etag = hashlib.sha1((raw_sha + "|" + qnorm + "|" + str(len(data))).encode("utf-8")).hexdigest()
     response.headers["ETag"] = etag
-    inm = request.headers.get("if-none-match")
-    if inm and inm == etag:
+    if (request.headers.get("if-none-match") or "") == etag:
         return Response(status_code=304)
-
     body = {"rows": data, "meta": {
         "total_rows": len(rows), "returned": len(data),
         "cached_seconds_left": max(0, CACHE_TTL - int(time.time() - _cache.get(csv_url, {}).get("ts", 0))),
@@ -550,20 +546,83 @@ def fetch(
     }}
     return JSONResponse(content=body, headers={"ETag": etag})
 
-# ---------- Account ----------
 @app.get("/v1/usage", tags=["Account"])
 def usage(
+    request: Request,
     api_key_header: Optional[str] = Header(None, alias="x-api-key", description="Your API key", example="FREE_EXAMPLE_KEY_123"),
     key: Optional[str] = Query(None, description="API key (alt)", example="FREE_EXAMPLE_KEY_123"),
 ):
     if not REQUIRE_API_KEY:
         return {"message": "API key requirement is disabled."}
     api_key = api_key_header or key
+    rl_or_429(request, api_key or (request.client.host if request.client else "unknown"))
     if not api_key or get_limit_for_key(api_key) <= 0:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     plan = (KEYS.get(api_key) or {}).get("plan")
     return {"api_key": api_key, "plan": plan, "period": current_period(),
             "used": get_usage(api_key), "limit": get_limit_for_key(api_key)}
+
+# ---------- Admin (HTTP Basic) ----------
+security = HTTPBasic()
+
+def admin_guard(credentials: HTTPBasicCredentials = Depends(security)):
+    u_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
+    p_ok = secrets.compare_digest(credentials.password, ADMIN_PASS)
+    if not (u_ok and p_ok):
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    return True
+
+@app.get("/admin/keys", tags=["Admin"])
+def admin_keys_page(auth: bool = Depends(admin_guard)):
+    # simple HTML table of keys with forms for actions
+    rows = []
+    for k, meta in KEYS.items():
+        plan = meta.get("plan", "?"); lim = meta.get("monthly_limit", "?")
+        rows.append(f"<tr><td><code>{k}</code></td><td>{plan}</td><td>{lim}</td>"
+                    f"<td><form method='post' action='/admin/keys/update' style='display:inline'>"
+                    f"<input type='hidden' name='api_key' value='{k}'/>"
+                    f"<select name='plan'><option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select>"
+                    f"<input name='monthly_limit' type='number' placeholder='(keep)' style='width:120px'/>"
+                    f"<button class='btn' type='submit'>Update</button></form> "
+                    f"<form method='post' action='/admin/keys/revoke' style='display:inline;margin-left:6px'>"
+                    f"<input type='hidden' name='api_key' value='{k}'/><button class='btn' type='submit'>Revoke</button></form></td></tr>")
+    table = "\n".join(rows) or "<tr><td colspan='4'><em>No keys yet.</em></td></tr>"
+    html = f"""<!doctype html><html><head>{_html_head("Admin — Keys")}</head><body>
+    <div class='wrap'><div class='card'>
+      <h1>Admin — Keys</h1>
+      <form method='post' action='/admin/keys/mint' style='margin:8px 0'>
+        <strong>Mint:</strong> plan
+        <select name='plan'><option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select>
+        limit <input name='monthly_limit' type='number' placeholder='(default)' style='width:120px'/>
+        <button class='btn' type='submit'>Create</button>
+      </form>
+      <table><thead><tr><th>API key</th><th>Plan</th><th>Monthly limit</th><th>Actions</th></tr></thead><tbody>
+        {table}
+      </tbody></table>
+    </div></div></body></html>"""
+    return HTMLResponse(html)
+
+@app.post("/admin/keys/mint", tags=["Admin"])
+def admin_mint_key(plan: str = Form("free"), monthly_limit: Optional[int] = Form(None), auth: bool = Depends(admin_guard)):
+    k = issue_key(plan, monthly_limit)
+    return PlainTextResponse(f"Created key: {k}\n\nGo back: /admin/keys")
+
+@app.post("/admin/keys/update", tags=["Admin"])
+def admin_update_key(api_key: str = Form(...), plan: str = Form("free"), monthly_limit: Optional[int] = Form(None), auth: bool = Depends(admin_guard)):
+    if api_key not in KEYS:
+        raise HTTPException(status_code=404, detail="Key not found")
+    KEYS[api_key]["plan"] = plan.lower() if plan.lower() in PLANS else "free"
+    if monthly_limit is not None and str(monthly_limit).strip() != "":
+        KEYS[api_key]["monthly_limit"] = int(monthly_limit)
+    save_keys(KEYS)
+    return PlainTextResponse("Updated.\n\nGo back: /admin/keys")
+
+@app.post("/admin/keys/revoke", tags=["Admin"])
+def admin_revoke_key(api_key: str = Form(...), auth: bool = Depends(admin_guard)):
+    if api_key in KEYS:
+        del KEYS[api_key]
+        save_keys(KEYS)
+    return PlainTextResponse("Revoked (if it existed).\n\nGo back: /admin/keys")
 
 # ---------- Startup ----------
 @app.on_event("startup")

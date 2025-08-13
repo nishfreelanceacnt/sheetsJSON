@@ -1,0 +1,4 @@
+{
+  "FREE_EXAMPLE_KEY_123": { "plan": "free", "monthly_limit": 200 },
+  "PRO_EXAMPLE_KEY_456":  { "plan": "pro",  "monthly_limit": 5000 }
+}

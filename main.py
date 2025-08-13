@@ -624,7 +624,11 @@ REQUEST_KEY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJ
 """
 
 # ---- /usage page (with safe progress bar) ----
-USAGE_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Usage")}</head>
+USAGE_HTML = (
+    "<!doctype html><html lang='en'><head>"
+    + _html_head("SheetsJSON — Usage")
+    + "</head>"
+    + """
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
   <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
@@ -650,8 +654,13 @@ USAGE_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON �
   <p class="hint">By using SheetsJSON you agree to our <a href="/terms">Terms</a> and acknowledge our <a href="/privacy">Privacy Policy</a>.</p>
 </div>
 <script>
-const $ = id => document.getElementById(id);
-function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; }
+const $ = (id) => document.getElementById(id);
+
+function toNum(x){
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function setBar(used, limit){
   const u = toNum(used);
   const m = Math.max(1, toNum(limit));
@@ -662,6 +671,7 @@ function setBar(used, limit){
   el.style.width = pct + "%";
   el.style.background = pct < 70 ? "#55d38a" : (pct < 90 ? "#e9c46a" : "#ef6f6c");
 }
+
 async function run(){
   const key = $("key").value.trim();
   if(!key){ $("status").textContent = "Enter your API key."; return; }
@@ -689,6 +699,8 @@ $("check").addEventListener("click", run);
 </script>
 </body></html>
 """
+)
+
 
 PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Privacy Policy")}</head>
 <body><div class="wrap">

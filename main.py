@@ -22,7 +22,7 @@ import stripe
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.9.0",
+    version="0.10.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
@@ -78,8 +78,10 @@ STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY")        # sk_test_...
 STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO")         # price_...
 STRIPE_PRICE_PLUS     = os.getenv("STRIPE_PRICE_PLUS")        # price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")    # whsec_...
-STRIPE_AUTOMATIC_TAX = os.getenv("STRIPE_AUTOMATIC_TAX", "0").lower() in ("1","true","yes","on")
 PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+STRIPE_AUTOMATIC_TAX  = os.getenv("STRIPE_AUTOMATIC_TAX", "0").lower() in ("1","true","yes","on")
+CANCEL_DOWNGRADE_PLAN = os.getenv("CANCEL_DOWNGRADE_PLAN", "free").lower()
+
 SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL)
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -123,7 +125,9 @@ def db_init():
                     plan        TEXT NOT NULL,
                     api_key     TEXT,
                     status      TEXT NOT NULL,
-                    created_at  TEXT NOT NULL
+                    created_at  TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT
                 );
             """)
             con.commit()
@@ -153,10 +157,24 @@ def db_init():
                     plan        TEXT NOT NULL,
                     api_key     TEXT,
                     status      TEXT NOT NULL,
-                    created_at  TEXT NOT NULL
+                    created_at  TEXT NOT NULL,
+                    customer_id TEXT,
+                    subscription_id TEXT
                 )
             """)
             con.commit()
+        # SQLite safe add (older dbs)
+        try:
+            with db_conn() as con:
+                cur = con.cursor()
+                for col in ("customer_id","subscription_id"):
+                    try:
+                        cur.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+                        con.commit()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 def current_period() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m")
@@ -573,12 +591,12 @@ PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
       <div class="plan"><h3>{PLANS['pro']['label']}</h3>
         <p><strong>{fmt_price(PLANS['pro']['price'])}</strong></p>
         <ul><li>{PLANS['pro']['monthly_limit']} requests / month</li><li>Priority cache & support</li><li>ETag / client caching</li></ul>
-        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and PUBLIC_BASE_URL) else "<div class='hint'>Stripe not configured</div>"}
+        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
       </div>
       <div class="plan"><h3>{PLANS['plus']['label']}</h3>
         <p><strong>{fmt_price(PLANS['plus']['price'])}</strong></p>
         <ul><li>{PLANS['plus']['monthly_limit']} requests / month</li><li>Higher limits on demand</li><li>Team usage reporting</li></ul>
-        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (STRIPE_SECRET_KEY and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL) else "<div class='hint'>Stripe not configured</div>"}
+        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
       </div>
     </div>
   </div>
@@ -790,7 +808,7 @@ async def request_key_submit(
 
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.9.0"}
+def healthz(): return {"ok": True, "version": "0.10.0"}
 
 # ---------- API ----------
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
@@ -915,30 +933,54 @@ def admin_revoke_key(api_key: str = Form(...), auth: bool = Depends(admin_guard)
             save_keys_file(keys)
     return PlainTextResponse("Revoked (if it existed).\n\nGo back: /admin/keys")
 
-# ---------- Stripe: checkout + success + webhook ----------
-def orders_insert(session_id: str, email: Optional[str], plan: str, api_key: Optional[str], status: str):
+# ---------- Billing ----------
+def orders_insert(session_id: str, email: Optional[str], plan: str,
+                  api_key: Optional[str], status: str,
+                  customer_id: Optional[str] = None, subscription_id: Optional[str] = None):
     with db_conn() as con:
         cur = con.cursor()
         if DB_IS_PG:
-            q = """INSERT INTO orders(session_id,email,plan,api_key,status,created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (session_id) DO NOTHING"""
-            cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z"))
+            q = """INSERT INTO orders(session_id,email,plan,api_key,status,created_at,customer_id,subscription_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (session_id) DO UPDATE SET
+                     email=EXCLUDED.email, plan=EXCLUDED.plan, api_key=COALESCE(orders.api_key, EXCLUDED.api_key),
+                     status=EXCLUDED.status, customer_id=COALESCE(orders.customer_id, EXCLUDED.customer_id),
+                     subscription_id=COALESCE(orders.subscription_id, EXCLUDED.subscription_id)"""
+            cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z", customer_id, subscription_id))
         else:
-            q = """INSERT OR IGNORE INTO orders(session_id,email,plan,api_key,status,created_at)
-                   VALUES (?,?,?,?,?,?)"""
-            cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z"))
+            existing = orders_get(session_id)
+            if existing:
+                q = """UPDATE orders SET email=?, plan=?, api_key=COALESCE(api_key, ?), status=?,
+                       customer_id=COALESCE(customer_id, ?), subscription_id=COALESCE(subscription_id, ?) WHERE session_id=?"""
+                cur.execute(q, (email, plan, api_key, status, customer_id, subscription_id, session_id))
+            else:
+                q = """INSERT INTO orders(session_id,email,plan,api_key,status,created_at,customer_id,subscription_id)
+                       VALUES (?,?,?,?,?,?,?,?)"""
+                cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z", customer_id, subscription_id))
         con.commit()
 
 def orders_get(session_id: str) -> Optional[Dict]:
     with db_conn() as con:
         cur = con.cursor()
-        q = "SELECT session_id,email,plan,api_key,status,created_at FROM orders WHERE session_id=%s" if DB_IS_PG else \
-            "SELECT session_id,email,plan,api_key,status,created_at FROM orders WHERE session_id=?"
+        q = "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE session_id=%s" if DB_IS_PG else \
+            "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE session_id=?"
         cur.execute(q, (session_id,))
         row = cur.fetchone()
         if not row: return None
-        return {"session_id": row[0], "email": row[1], "plan": row[2], "api_key": row[3], "status": row[4], "created_at": row[5]}
+        return {"session_id": row[0], "email": row[1], "plan": row[2], "api_key": row[3], "status": row[4], "created_at": row[5],
+                "customer_id": row[6], "subscription_id": row[7]}
+
+def orders_find_by_customer(customer_id: str) -> Optional[Dict]:
+    with db_conn() as con:
+        cur = con.cursor()
+        q = "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE customer_id=%s ORDER BY created_at DESC LIMIT 1" if DB_IS_PG else \
+            "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE customer_id=? ORDER BY created_at DESC LIMIT 1"
+    ...
+        cur.execute(q, (customer_id,))
+        row = cur.fetchone()
+        if not row: return None
+        return {"session_id": row[0], "email": row[1], "plan": row[2], "api_key": row[3], "status": row[4], "created_at": row[5],
+                "customer_id": row[6], "subscription_id": row[7]}
 
 @app.post("/billing/checkout", tags=["Billing"])
 def billing_checkout(plan: str = Form(...)):
@@ -948,20 +990,18 @@ def billing_checkout(plan: str = Form(...)):
     if plan not in ("pro", "plus"):
         raise HTTPException(status_code=400, detail="Invalid plan")
     price_id = STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PLUS
-    try:
-        params = dict(
+    params = dict(
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
         allow_promotion_codes=True,
         success_url=f"{PUBLIC_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{PUBLIC_BASE_URL}/pricing",
         metadata={"plan": plan},
-        )
-        if STRIPE_AUTOMATIC_TAX:
-            params["automatic_tax"] = {"enabled": True}
-
+    )
+    if STRIPE_AUTOMATIC_TAX:
+        params["automatic_tax"] = {"enabled": True}
+    try:
         session = stripe.checkout.Session.create(**params)
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
     return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")
@@ -991,16 +1031,23 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook signature error: {e}")
 
-    if event["type"] == "checkout.session.completed":
+    t = event["type"]
+
+    if t == "checkout.session.completed":
         s = event["data"]["object"]
         session_id = s["id"]
         plan = ((s.get("metadata") or {}).get("plan") or "pro").lower()
         email = (s.get("customer_details") or {}).get("email") or s.get("customer_email")
+        customer_id = s.get("customer")
+        subscription_id = s.get("subscription")
+
         existing = orders_get(session_id)
         if existing and existing.get("api_key"):
             return {"ok": True}
+
         k = issue_key(plan)
-        orders_insert(session_id, email, plan, k, "completed")
+        orders_insert(session_id, email, plan, k, "completed", customer_id, subscription_id)
+
         if SMTP_HOST and SMTP_USER and SMTP_PASS and email:
             try:
                 msg = EmailMessage()
@@ -1015,6 +1062,35 @@ async def stripe_webhook(request: Request):
                     s2.starttls(); s2.login(SMTP_USER, SMTP_PASS); s2.send_message(msg)
             except Exception:
                 pass
+
+    elif t == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        customer_id = sub.get("customer")
+        rec = orders_find_by_customer(customer_id) if customer_id else None
+        if rec and rec.get("api_key"):
+            if KEYS_BACKEND == "db":
+                keys_db_update(rec["api_key"], plan=CANCEL_DOWNGRADE_PLAN, monthly_limit=PLANS.get(CANCEL_DOWNGRADE_PLAN, PLANS["free"])["monthly_limit"])
+            else:
+                keys = load_keys_file()
+                if rec["api_key"] in keys:
+                    keys[rec["api_key"]]["plan"] = CANCEL_DOWNGRADE_PLAN
+                    keys[rec["api_key"]]["monthly_limit"] = PLANS.get(CANCEL_DOWNGRADE_PLAN, PLANS["free"])["monthly_limit"]
+                    save_keys_file(keys)
+
+    elif t == "invoice.payment_failed":
+        inv = event["data"]["object"]
+        customer_id = inv.get("customer")
+        rec = orders_find_by_customer(customer_id) if customer_id else None
+        if rec and rec.get("api_key"):
+            if KEYS_BACKEND == "db":
+                keys_db_update(rec["api_key"], plan=CANCEL_DOWNGRADE_PLAN, monthly_limit=PLANS.get(CANCEL_DOWNGRADE_PLAN, PLANS["free"])["monthly_limit"])
+            else:
+                keys = load_keys_file()
+                if rec["api_key"] in keys:
+                    keys[rec["api_key"]]["plan"] = CANCEL_DOWNGRADE_PLAN
+                    keys[rec["api_key"]]["monthly_limit"] = PLANS.get(CANCEL_DOWNGRADE_PLAN, PLANS["free"])["monthly_limit"]
+                    save_keys_file(keys)
+
     return {"ok": True}
 
 # ---------- Startup ----------

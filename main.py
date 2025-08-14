@@ -1,7 +1,7 @@
 import os, time, io, csv, json, requests, datetime, re, hashlib, smtplib, uuid, secrets
 from typing import List, Dict, Optional, Tuple
 from email.message import EmailMessage
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunsplit
 
 from fastapi import FastAPI, HTTPException, Query, Header, Request, Response, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +32,7 @@ if SENTRY_DSN:
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.12.0",
+    version="0.13.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
@@ -54,14 +54,14 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "true").lower() in ("1", "true", "yes")
 
 # Storage backends
-KEYS_BACKEND = os.getenv("KEYS_BACKEND", "db").lower()
+KEYS_BACKEND = os.getenv("KEYS_BACKEND", "db").lower()   # 'db' or 'file'
 KEYS_PATH = os.getenv("KEYS_PATH", "keys.json")
 
 USAGE_DB = os.getenv("USAGE_DB_PATH", "usage.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_IS_PG = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
-# Key request handling
+# Key requests
 KEY_REQUEST_MODE = os.getenv("KEY_REQUEST_MODE", "file")  # 'file' or 'email'
 KEY_REQUEST_FILE = os.getenv("KEY_REQUEST_FILE", "key_requests.jsonl")
 KEY_AUTO_ISSUE = os.getenv("KEY_AUTO_ISSUE", "true").lower() in ("1", "true", "yes")
@@ -97,7 +97,7 @@ SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# --- Analytics / host info & SEO tokens ---
+# --- Analytics / SEO tokens ---
 PLAUSIBLE_DOMAIN = os.getenv("PLAUSIBLE_DOMAIN", "").strip()
 GOOGLE_SITE_VERIFICATION = os.getenv("GOOGLE_SITE_VERIFICATION","").strip()
 
@@ -111,13 +111,12 @@ except Exception:
 def _analytics_snippet() -> str:
     if not PLAUSIBLE_DOMAIN:
         return ""
-    return f'<script defer data-domain="{PLAUSIBLE_DOMAIN}" src="https://plausible.io/js/script.js"></script>'
+    return '<script defer data-domain="' + PLAUSIBLE_DOMAIN + '" src="https://plausible.io/js/script.js"></script>'
 
 def _google_verify_snippet() -> str:
     if not GOOGLE_SITE_VERIFICATION:
         return ""
-    # token only; meta name/value added here
-    return f'<meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}"/>'
+    return '<meta name="google-site-verification" content="' + GOOGLE_SITE_VERIFICATION + '"/>'
 
 # ---------- Security headers ----------
 class SecurityHeaders(BaseHTTPMiddleware):
@@ -128,13 +127,14 @@ class SecurityHeaders(BaseHTTPMiddleware):
         resp.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+        # Allow Plausible if configured
         if PLAUSIBLE_DOMAIN:
             resp.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
                 "img-src 'self' data:; "
                 "style-src 'self' 'unsafe-inline'; "
                 "script-src 'self' https://plausible.io; "
-                "connect-src 'self';"
+                "connect-src 'self' https://plausible.io;"
             )
         return resp
 
@@ -544,186 +544,170 @@ def favicon_svg():
 
 # ---------- Shared HTML head ----------
 def _html_head(title: str) -> str:
-    # canonical cannot include path without request, so we keep it generic
-    return f"""
-<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
-{_google_verify_snippet()}
-<title>{title}</title><link rel="icon" href="/favicon.svg">
-{_analytics_snippet()}
+    return (
+        '<meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />'
+        + _google_verify_snippet()
+        + "<title>" + title + "</title><link rel=\"icon\" href=\"/favicon.svg\">"
+        + _analytics_snippet()
+        + """
 <style>
-  :root{{--bg:#0b1020;--card:#121933;--muted:#8da2d0;--text:#eef2ff;--accent:#6ea8fe;}}
-  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto}}
-  .wrap{{max-width:960px;margin:40px auto;padding:0 16px}}
-  .card{{background:var(--card);border-radius:16px;padding:22px;box-shadow:0 4px 24px rgba(0,0,0,.25)}}
-  h1{{margin:0 0 6px;font-size:28px}} p{{margin:0 0 16px;color:var(--muted)}}
-  header{{display:flex;align-items:center;gap:12px;margin-bottom:14px}}
-  header img{{width:36px;height:36px}}
-  nav a{{color:#9cc2ff;margin-right:14px;text-decoration:none}} nav a:hover{{text-decoration:underline}}
-  label{{display:block;margin:12px 0 6px;color:#c8d1f5}}
-  input,textarea,button,select{{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #2a3769;background:#0e1630;color:var(--text)}}
-  textarea{{min-height:64px}}
-  button{{background:var(--accent);border:none;color:#04122d;font-weight:700;cursor:pointer}}
-  .grid{{display:grid;gap:12px}} @media(min-width:820px){{.grid{{grid-template-columns:1.5fr 1fr}}}}
-  pre{{background:#0a0f24;border:1px solid #26335f;border-radius:12px;padding:14px;overflow:auto}}
-  small{{color:var(--muted)}} .row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
-  .hint{{font-size:13px;color:#aab8e6}} .pill{{display:inline-block;background:#0a1638;border:1px solid #24336a;border-radius:99px;padding:4px 8px;margin-right:6px;color:#a9b8ee}}
-  a{{color:#9cc2ff}} #status{{margin:8px 0 0 0;font-size:13px;color:#aab8e6}} code{{background:#0a0f24;border:1px solid #26335f;border-radius:6px;padding:0 4px}}
-  .pricegrid{{display:grid;gap:12px}} @media(min-width:720px){{.pricegrid{{grid-template-columns:repeat(3,1fr)}}}}
-  .plan{{background:#0e1630;border:1px solid #233366;border-radius:14px;padding:16px}}
-  .plan h3{{margin:0 0 6px}} .cta{{margin-top:8px}}
-  table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1px solid #233366;text-align:left}}
-  .btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #233366;background:#0e1630;color:#eaf0ff;text-decoration:none}}
-  .cards{{display:grid;gap:12px}} @media(min-width:820px){{.cards{{grid-template-columns:repeat(3,1fr)}}}}
+  :root{--bg:#0b1020;--card:#121933;--muted:#8da2d0;--text:#eef2ff;--accent:#6ea8fe;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto}
+  .wrap{max-width:960px;margin:40px auto;padding:0 16px}
+  .card{background:var(--card);border-radius:16px;padding:22px;box-shadow:0 4px 24px rgba(0,0,0,.25)}
+  h1{margin:0 0 6px;font-size:28px} p{margin:0 0 16px;color:var(--muted)}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  header img{width:36px;height:36px}
+  nav a{color:#9cc2ff;margin-right:14px;text-decoration:none} nav a:hover{text-decoration:underline}
+  label{display:block;margin:12px 0 6px;color:#c8d1f5}
+  input,textarea,button,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #2a3769;background:#0e1630;color:var(--text)}
+  textarea{min-height:64px}
+  button{background:var(--accent);border:none;color:#04122d;font-weight:700;cursor:pointer}
+  .grid{display:grid;gap:12px} @media(min-width:820px){.grid{grid-template-columns:1.5fr 1fr}}
+  pre{background:#0a0f24;border:1px solid #26335f;border-radius:12px;padding:14px;overflow:auto}
+  small{color:var(--muted)} .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .hint{font-size:13px;color:#aab8e6} .pill{display:inline-block;background:#0a1638;border:1px solid #24336a;border-radius:99px;padding:4px 8px;margin-right:6px;color:#a9b8ee}
+  a{color:#9cc2ff} #status{margin:8px 0 0 0;font-size:13px;color:#aab8e6} code{background:#0a0f24;border:1px solid #26335f;border-radius:6px;padding:0 4px}
+  .pricegrid{display:grid;gap:12px} @media(min-width:720px){.pricegrid{grid-template-columns:repeat(3,1fr)}}
+  .plan{background:#0e1630;border:1px solid #233366;border-radius:14px;padding:16px}
+  .plan h3{margin:0 0 6px} .cta{margin-top:8px}
+  table{width:100%;border-collapse:collapse} th,td{padding:8px;border-bottom:1px solid #233366;text-align:left}
+  .btn{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #233366;background:#0e1630;color:#eaf0ff;text-decoration:none}
+  .cards{display:grid;gap:12px} @media(min-width:820px){.cards{grid-template-columns:repeat(3,1fr)}}
 </style>"""
+    )
 
 # ---------- Pages ----------
-HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — CSV → JSON API")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo"/><div><strong>SheetsJSON</strong><br/><small class="hint">Google Sheets → JSON API</small></div></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card"><h1>Try it now</h1><p>Paste a Google Sheets <strong>Publish to web → CSV</strong> link (or click an example), add your API key, and press Fetch.</p>
-    <div class="grid"><div>
-      <label>Google Sheets CSV URL</label><input id="csv" placeholder="https://docs.google.com/.../pub?output=csv"/>
-      <label>API key <small class="hint">(header <code>x-api-key</code> or <code>?key=</code>)</small></label><input id="key" placeholder="FREE_EXAMPLE_KEY_123"/>
-      <div class="row"><div><label><span class="pill">optional</span> select</label><input id="select" placeholder="name,email"/></div>
-      <div><label><span class="pill">optional</span> order <small class="hint">(e.g., <code>price:num</code>, <code>-age:num</code>, or <code>name</code>)</small></label><input id="order" placeholder="price:num"/></div></div>
-      <div class="row"><div><label><span class="pill">optional</span> limit</label><input id="limit" type="number" placeholder="50"/></div>
-      <div><label><span class="pill">optional</span> offset</label><input id="offset" type="number" placeholder="0"/></div></div>
-      <label><span class="pill">optional</span> filters (one per line)</label>
-      <textarea id="filters" placeholder="status:active&#10;name~ali&#10;age&gt;=21&#10;price&lt;100"></textarea>
-      <small class="hint">Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>
-      <div class="row" style="margin-top:8px"><button id="go" type="button" onclick="window.plausible && plausible('FetchClicked')">Fetch JSON</button><button id="usage" type="button">Check Usage</button></div>
-      <div id="status">Ready.</div><small class="hint">Need a key? <a href="/request-key">Request one</a>. See <a href="/examples">Examples</a>.</small></div>
-      <div><label>Result</label><pre id="out">Waiting…</pre><label>Curl</label><pre id="curl"># will appear after a request</pre><label>ETag</label><pre id="etag"># returns entity tag for caching</pre></div>
-    </div>
-  </div>
-  <p class="hint">By using SheetsJSON you agree to our <a href="/terms">Terms</a> and acknowledge our <a href="/privacy">Privacy Policy</a>.</p>
-</div>
-<script>
-const $ = (id) => document.getElementById(id);
-function buildURL() {{
-  const u = new URL(window.location.origin + "/v1/fetch");
-  const filters = $("filters").value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
-  const csv = $("csv").value.trim(); if (csv) u.searchParams.set("csv_url", csv);
-  const sel = $("select").value.trim(); if (sel) u.searchParams.set("select", sel);
-  const ord = $("order").value.trim();  if (ord) u.searchParams.set("order", ord);
-  const lim = $("limit").value.trim();  if (lim) u.searchParams.set("limit", lim);
-  const off = $("offset").value.trim(); if (off) u.searchParams.set("offset", off);
-  filters.forEach(f => u.searchParams.append("filter", f));
-  return u;
-}}
-async function runFetch() {{
-  $("status").textContent = "Loading…";
-  const key = $("key").value.trim();
-  const url = buildURL();
-  try {{
-    const res = await fetch(url, key ? {{ headers: {{ "x-api-key": key }} }} : undefined);
-    $("status").textContent = "HTTP " + res.status;
-    const text = await res.text();
-    const etag = res.headers.get("etag"); $("etag").textContent = etag ? etag : "(none)";
-    try {{ $("out").textContent = JSON.stringify(JSON.parse(text), null, 2); }} catch {{ $("out").textContent = text; }}
-    const curl = ['curl', key ? "-H \\"x-api-key: " + key.replace(/"/g,'\\\\\\"') + "\\"" : "", etag ? "-H \\"If-None-Match: " + etag + "\\"" : "", '"' + url.toString().replace(/"/g,'\\"') + '"'].filter(Boolean).join(" ");
-    $("curl").textContent = curl;
-  }} catch (e) {{ $("status").textContent = "Error"; $("out").textContent = "Error: " + e; console.error(e); }}
-}}
-async function runUsage() {{
-  $("status").textContent = "Loading usage…";
-  const key = $("key").value.trim(); if (!key) {{ $("out").textContent = "Add your API key first."; $("status").textContent = "Ready."; return; }}
-  try {{
-    const res = await fetch("/v1/usage", {{ headers: {{ "x-api-key": key }} }}); $("status").textContent = "HTTP " + res.status;
-    const text = await res.text(); try {{ $("out").textContent = JSON.stringify(JSON.parse(text), null, 2); }} catch {{ $("out").textContent = text; }}
-  }} catch (e) {{ $("status").textContent = "Error"; $("out").textContent = "Error: " + e; console.error(e); }}
-}}
-function prefillFromQuery(){{
-  const q = new URLSearchParams(location.search);
-  const map = [ ["csv","csv"], ["key","key"], ["select","select"], ["order","order"], ["limit","limit"], ["offset","offset"] ];
-  map.forEach(([qs,id])=>{{ const v=q.get(qs); if(v!==null) $(id).value=v; }});
-  const filters = q.getAll("filter");
-  if(filters.length) $("filters").value = filters.join("\\n");
-  if(q.get("autorun")==="1") runFetch();
-}}
-$("go").addEventListener("click", runFetch); $("usage").addEventListener("click", runUsage);
-prefillFromQuery();
-</script></body></html>
-"""
+def _home_html() -> str:
+    return (
+        "<!doctype html><html lang='en'><head>"
+        + _html_head("SheetsJSON — CSV → JSON API")
+        + "</head><body><div class='wrap'>"
+        + "<header><img src='/logo.svg' alt='SheetsJSON logo'/>"
+        + "<div><strong>SheetsJSON</strong><br/><small class='hint'>Google Sheets → JSON API</small></div></header>"
+        + "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a><a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+        + "<div class='card'><h1>Try it now</h1><p>Paste a Google Sheets <strong>Publish to web → CSV</strong> link (or click an example), add your API key, and press Fetch.</p>"
+        + "<div class='grid'><div>"
+        + "<label>Google Sheets CSV URL</label><input id='csv' placeholder='https://docs.google.com/.../pub?output=csv'/>"
+        + "<label>API key <small class='hint'>(header <code>x-api-key</code> or <code>?key=</code>)</small></label><input id='key' placeholder='FREE_EXAMPLE_KEY_123'/>"
+        + "<div class='row'><div><label><span class='pill'>optional</span> select</label><input id='select' placeholder='name,email'/></div>"
+        + "<div><label><span class='pill'>optional</span> order <small class='hint'>(e.g., <code>price:num</code>, <code>-age:num</code>, or <code>name</code>)</small></label><input id='order' placeholder='price:num'/></div></div>"
+        + "<div class='row'><div><label><span class='pill'>optional</span> limit</label><input id='limit' type='number' placeholder='50'/></div>"
+        + "<div><label><span class='pill'>optional</span> offset</label><input id='offset' type='number' placeholder='0'/></div></div>"
+        + "<label><span class='pill'>optional</span> filters (one per line)</label>"
+        + "<textarea id='filters' placeholder='status:active&#10;name~ali&#10;age&gt;=21&#10;price&lt;100'></textarea>"
+        + "<small class='hint'>Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>"
+        + "<div class='row' style='margin-top:8px'><button id='go' type='button' onclick='window.plausible && plausible(\"FetchClicked\")'>Fetch JSON</button><button id='usage' type='button'>Check Usage</button></div>"
+        + "<div id='status'>Ready.</div><small class='hint'>Need a key? <a href='/request-key'>Request one</a>. See <a href='/examples'>Examples</a>.</small></div>"
+        + "<div><label>Result</label><pre id='out'>Waiting…</pre><label>Curl</label><pre id='curl'># will appear after a request</pre><label>ETag</label><pre id='etag'># returns entity tag for caching</pre></div>"
+        + "</div></div>"
+        + "<p class='hint'>By using SheetsJSON you agree to our <a href='/terms'>Terms</a> and acknowledge our <a href='/privacy'>Privacy Policy</a>.</p>"
+        + "</div>"
+        + "<script>"
+        + "const $=(id)=>document.getElementById(id);"
+        + "function buildURL(){const u=new URL(window.location.origin+\"/v1/fetch\");"
+        + "const filters=$(\"filters\").value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);"
+        + "const csv=$(\"csv\").value.trim(); if(csv) u.searchParams.set(\"csv_url\",csv);"
+        + "const sel=$(\"select\").value.trim(); if(sel) u.searchParams.set(\"select\",sel);"
+        + "const ord=$(\"order\").value.trim(); if(ord) u.searchParams.set(\"order\",ord);"
+        + "const lim=$(\"limit\").value.trim(); if(lim) u.searchParams.set(\"limit\",lim);"
+        + "const off=$(\"offset\").value.trim(); if(off) u.searchParams.set(\"offset\",off);"
+        + "filters.forEach(f=>u.searchParams.append(\"filter\",f)); return u;}"
+        + "async function runFetch(){"
+        + "$(\"status\").textContent='Loading…'; const key=$(\"key\").value.trim(); const url=buildURL();"
+        + "try{const res=await fetch(url, key?{headers:{\"x-api-key\":key}}:undefined);"
+        + "$(\"status\").textContent='HTTP '+res.status; const text=await res.text();"
+        + "const etag=res.headers.get('etag'); $(\"etag\").textContent=etag?etag:'(none)';"
+        + "try{$(\"out\").textContent=JSON.stringify(JSON.parse(text),null,2);}catch{$(\"out\").textContent=text;}"
+        + "const curl=['curl', key?'-H \\\"x-api-key: '+key.replace(/\"/g,'\\\\\\\"')+'\\\"':'', etag?'-H \\\"If-None-Match: '+etag+'\\\"':'', '\"'+url.toString().replace(/\"/g,'\\\"')+'\"'].filter(Boolean).join(' ');"
+        + "$(\"curl\").textContent=curl;"
+        + "}catch(e){$(\"status\").textContent='Error'; $(\"out\").textContent='Error: '+e; console.error(e);}}"
+        + "async function runUsage(){$(\"status\").textContent='Loading usage…'; const key=$(\"key\").value.trim(); if(!key){$(\"out\").textContent='Add your API key first.'; $(\"status\").textContent='Ready.'; return;} "
+        + "try{const res=await fetch('/v1/usage',{headers:{'x-api-key':key}}); $(\"status\").textContent='HTTP '+res.status; const text=await res.text(); try{$(\"out\").textContent=JSON.stringify(JSON.parse(text),null,2);}catch{$(\"out\").textContent=text;}}catch(e){$(\"status\").textContent='Error'; $(\"out\").textContent='Error: '+e;}}"
+        + "function prefillFromQuery(){const q=new URLSearchParams(location.search); const map=[['csv','csv'],['key','key'],['select','select'],['order','order'],['limit','limit'],['offset','offset']]; map.forEach(([qs,id])=>{const v=q.get(qs); if(v!==null) $(id).value=v;}); const filters=q.getAll('filter'); if(filters.length) $(\"filters\").value=filters.join('\\n'); if(q.get('autorun')==='1') runFetch();}"
+        + "document.getElementById('go').addEventListener('click',runFetch); document.getElementById('usage').addEventListener('click',runUsage); prefillFromQuery();"
+        + "</script></body></html>"
+    )
 
 def fmt_price(n: int) -> str:
     return "$0" if n == 0 else f"${n}/mo"
 
-# Pricing with Plausible submit events + quick examples
-PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Pricing & Docs")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card"><h1>Pricing</h1>
-    <div class="pricegrid">
-      <div class="plan"><h3>{PLANS['free']['label']}</h3>
-        <p><strong>{fmt_price(PLANS['free']['price'])}</strong></p>
-        <ul><li>{PLANS['free']['monthly_limit']} requests / month</li><li>5-minute server cache</li><li>Filters & sorting</li></ul>
-        <div class="cta"><a class="hint" href="/request-key">Get a Free key →</a></div>
-      </div>
-      <div class="plan"><h3>{PLANS['pro']['label']}</h3>
-        <p><strong>{fmt_price(PLANS['pro']['price'])}</strong></p>
-        <ul><li>{PLANS['pro']['monthly_limit']} requests / month</li><li>Priority cache & support</li><li>ETag / client caching</li></ul>
-        {"<form method='post' action='/billing/checkout' onsubmit=\\"window.plausible && plausible('CheckoutStart', {props:{plan:'pro'}})\\"><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
-      </div>
-      <div class="plan"><h3>{PLANS['plus']['label']}</h3>
-        <p><strong>{fmt_price(PLANS['plus']['price'])}</strong></p>
-        <ul><li>{PLANS['plus']['monthly_limit']} requests / month</li><li>Higher limits on demand</li><li>Team usage reporting</li></ul>
-        {"<form method='post' action='/billing/checkout' onsubmit=\\"window.plausible && plausible('CheckoutStart', {props:{plan:'plus'}})\\"><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
-      </div>
-    </div>
-  </div>
-  <div class="card" style="margin-top:14px"><h1>Quick Docs</h1>
-    <p><strong>Endpoint:</strong> <code>GET /v1/fetch</code></p>
-    <p><strong>Header:</strong> <code>x-api-key: YOUR_KEY</code> (or <code>?key=YOUR_KEY</code>)</p>
-    <p><strong>Required:</strong> <code>csv_url</code> → Google Sheets <em>Publish to web → CSV</em> link</p>
-    <ul>
-      <li><code>select</code>: e.g., <code>name,email</code></li>
-      <li><code>filter</code> (repeatable): <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code></li>
-      <li><code>order</code>: string <code>col</code> or numeric <code>col:num</code> (desc with <code>-</code>)</li>
-      <li><code>limit</code>, <code>offset</code>; <code>cache_bypass=1</code> to refetch</li>
-    </ul>
-    <h3>Quick examples</h3>
-    <pre>curl -H "x-api-key: YOUR_KEY" "{PUBLIC_BASE_URL}/v1/fetch?csv_url=...&filter=status:active&order=-price:num&limit=50"</pre>
-    <pre>// Node
-// npm i node-fetch
-import fetch from 'node-fetch';
-const res = await fetch('{PUBLIC_BASE_URL}/v1/fetch?csv_url=...', {{ headers: {{'x-api-key':'YOUR_KEY'}} }});
-const data = await res.json();</pre>
-    <pre># Python
-import requests
-r = requests.get('{PUBLIC_BASE_URL}/v1/fetch', params={{'csv_url':'...'}}, headers={{'x-api-key':'YOUR_KEY'}})
-print(r.json())</pre>
-  </div>
-</div></body></html>
-"""
+def _pricing_html() -> str:
+    sub_on = SUBSCRIBE_ENABLED
+    pro_button = (
+        "<form method='post' action='/billing/checkout' onsubmit=\"window.plausible && plausible('CheckoutStart', {props:{plan:'pro'}})\">"
+        "<input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>"
+        if sub_on else "<div class='hint'>Stripe not configured</div>"
+    )
+    plus_button = (
+        "<form method='post' action='/billing/checkout' onsubmit=\"window.plausible && plausible('CheckoutStart', {props:{plan:'plus'}})\">"
+        "<input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>"
+        if sub_on else "<div class='hint'>Stripe not configured</div>"
+    )
+    return (
+        "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — Pricing & Docs")+"</head>"
+        "<body><div class='wrap'>"
+        "<header><img src='/logo.svg' alt='SheetsJSON logo' style='width:36px;height:36px;margin-right:8px'/><strong>SheetsJSON</strong></header>"
+        "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a><a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+        "<div class='card'><h1>Pricing</h1>"
+        "<div class='pricegrid'>"
+        "<div class='plan'><h3>"+PLANS['free']['label']+"</h3>"
+        "<p><strong>"+fmt_price(PLANS['free']['price'])+"</strong></p>"
+        "<ul><li>"+str(PLANS['free']['monthly_limit'])+" requests / month</li><li>5-minute server cache</li><li>Filters & sorting</li></ul>"
+        "<div class='cta'><a class='hint' href='/request-key'>Get a Free key →</a></div></div>"
+        "<div class='plan'><h3>"+PLANS['pro']['label']+"</h3>"
+        "<p><strong>"+fmt_price(PLANS['pro']['price'])+"</strong></p>"
+        "<ul><li>"+str(PLANS['pro']['monthly_limit'])+" requests / month</li><li>Priority cache & support</li><li>ETag / client caching</li></ul>"
+        + pro_button +
+        "</div>"
+        "<div class='plan'><h3>"+PLANS['plus']['label']+"</h3>"
+        "<p><strong>"+fmt_price(PLANS['plus']['price'])+"</strong></p>"
+        "<ul><li>"+str(PLANS['plus']['monthly_limit'])+" requests / month</li><li>Higher limits on demand</li><li>Team usage reporting</li></ul>"
+        + plus_button +
+        "</div>"
+        "</div></div>"
+        "<div class='card' style='margin-top:14px'><h1>Quick Docs</h1>"
+        "<p><strong>Endpoint:</strong> <code>GET /v1/fetch</code></p>"
+        "<p><strong>Header:</strong> <code>x-api-key: YOUR_KEY</code> (or <code>?key=YOUR_KEY</code>)</p>"
+        "<p><strong>Required:</strong> <code>csv_url</code> → Google Sheets <em>Publish to web → CSV</em> link</p>"
+        "<ul>"
+        "<li><code>select</code>: e.g., <code>name,email</code></li>"
+        "<li><code>filter</code> (repeatable): <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code></li>"
+        "<li><code>order</code>: string <code>col</code> or numeric <code>col:num</code> (desc with <code>-</code>)</li>"
+        "<li><code>limit</code>, <code>offset</code>; <code>cache_bypass=1</code> to refetch</li>"
+        "</ul>"
+        "<h3>Quick examples</h3>"
+        "<pre>curl -H \"x-api-key: YOUR_KEY\" \""+PUBLIC_BASE_URL+"/v1/fetch?csv_url=...&filter=status:active&order=-price:num&limit=50\"</pre>"
+        "<pre>// Node\n// npm i node-fetch\nimport fetch from 'node-fetch';\nconst res = await fetch('"+PUBLIC_BASE_URL+"/v1/fetch?csv_url=...', { headers: {'x-api-key':'YOUR_KEY'} });\nconst data = await res.json();</pre>"
+        "<pre># Python\nimport requests\nr = requests.get('"+PUBLIC_BASE_URL+"/v1/fetch', params={'csv_url':'...'}, headers={'x-api-key':'YOUR_KEY'})\nprint(r.json())</pre>"
+        "</div></div></body></html>"
+    )
 
-REQUEST_KEY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Request a Key")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card"><h1>Request an API Key</h1>
-    <p class="hint">Free keys are issued automatically. Pro/Plus keys are also issued here for demo purposes.</p>
-    <form method="post" action="/request-key">
-      <label>Name</label><input name="name" required />
-      <label>Email</label><input name="email" type="email" required />
-      <label>Plan</label>
-      <select name="plan">
-        <option value="free">Free ({PLANS['free']['monthly_limit']} req/mo)</option>
-        <option value="pro">Pro ({PLANS['pro']['monthly_limit']} req/mo) – ${PLANS['pro']['price']}/mo</option>
-        <option value="plus">Plus ({PLANS['plus']['monthly_limit']} req/mo) – ${PLANS['plus']['price']}/mo</option>
-      </select>
-      <label>Use case</label><textarea name="use_case" placeholder="How will you use SheetsJSON?"></textarea>
-      <input name="company" style="display:none" autocomplete="off" /> <!-- honeypot -->
-      <div style="margin-top:8px"><button type="submit">Submit</button></div>
-    </form>
-    <p class="hint" style="margin-top:8px">We’ll show your key on the next screen. (For production, wire payments or approval flow.)</p>
-  </div>
-</div></body></html>
-"""
+REQUEST_KEY_HTML = (
+    "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — Request a Key")+"</head>"
+    "<body><div class='wrap'>"
+    "<header><img src='/logo.svg' alt='SheetsJSON logo' style='width:36px;height:36px;margin-right:8px'/><strong>SheetsJSON</strong></header>"
+    "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a><a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+    "<div class='card'><h1>Request an API Key</h1>"
+    "<p class='hint'>Free keys are issued automatically. Pro/Plus keys are also issued here for demo purposes.</p>"
+    "<form method='post' action='/request-key'>"
+    "<label>Name</label><input name='name' required />"
+    "<label>Email</label><input name='email' type='email' required />"
+    "<label>Plan</label>"
+    "<select name='plan'>"
+    "<option value='free'>Free ("+str(PLANS['free']['monthly_limit'])+" req/mo)</option>"
+    "<option value='pro'>Pro ("+str(PLANS['pro']['monthly_limit'])+" req/mo) – $"+str(PLANS['pro']['price'])+"/mo</option>"
+    "<option value='plus'>Plus ("+str(PLANS['plus']['monthly_limit'])+" req/mo) – $"+str(PLANS['plus']['price'])+"/mo</option>"
+    "</select>"
+    "<label>Use case</label><textarea name='use_case' placeholder='How will you use SheetsJSON?'></textarea>"
+    "<input name='company' style='display:none' autocomplete='off' />"
+    "<div style='margin-top:8px'><button type='submit'>Submit</button></div>"
+    "</form>"
+    "<p class='hint' style='margin-top:8px'>We’ll show your key on the next screen. (For production, wire payments or approval flow.)</p>"
+    "</div></div></body></html>"
+)
 
-# /usage page (non-f-string to avoid JS brace issues)
+# /usage page (non-f-string)
 USAGE_HTML = (
     "<!doctype html><html lang='en'><head>"
     + _html_head("SheetsJSON — Usage")
@@ -784,90 +768,66 @@ $("check").addEventListener("click", run);
 """
 )
 
-PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Privacy Policy")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card">
-    <h1>Privacy Policy</h1>
-    <ul>
-      <li><strong>Data we store:</strong> API key usage counts (per month), API keys, and key request submissions (name/email/use case).</li>
-      <li><strong>Retention:</strong> Usage counts and keys are kept while the service is active. Key requests may be retained for support and abuse prevention.</li>
-      <li><strong>Security:</strong> All traffic is over HTTPS. Keys are required for API calls. You should not send private or sensitive data in your sheets.</li>
-      <li><strong>Contact:</strong> For questions or data removal, email: <em>(add your support email)</em>.</li>
-    </ul>
-  </div>
-</div></body></html>
-"""
+PRIVACY_HTML = (
+    "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — Privacy Policy")+"</head>"
+    "<body><div class='wrap'><header><img src='/logo.svg' alt='SheetsJSON logo' style='width:36px;height:36px;margin-right:8px'/>"
+    "<strong>SheetsJSON</strong></header><nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a>"
+    "<a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+    "<div class='card'><h1>Privacy Policy</h1>"
+    "<ul><li><strong>Data we store:</strong> API key usage counts (per month), API keys, and key request submissions (name/email/use case).</li>"
+    "<li><strong>Retention:</strong> Usage counts and keys are kept while the service is active. Key requests may be retained for support and abuse prevention.</li>"
+    "<li><strong>Security:</strong> All traffic is over HTTPS. Keys are required for API calls. You should not send private or sensitive data in your sheets.</li>"
+    "<li><strong>Contact:</strong> For questions or data removal, email: <em>(add your support email)</em>.</li></ul>"
+    "</div></div></body></html>"
+)
 
-TERMS_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Terms of Service")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card">
-    <h1>Terms of Service</h1>
-    <ul>
-      <li><strong>Acceptable Use:</strong> Only use published Google Sheets CSV links.</li>
-      <li><strong>Rate Limits:</strong> We may throttle or block excessive requests.</li>
-      <li><strong>Availability:</strong> Service is provided “as is” without warranty. Free tier may sleep after inactivity.</li>
-      <li><strong>Liability:</strong> We’re not liable for lost data or downstream issues caused by your use of this service.</li>
-      <li><strong>Changes:</strong> We may change pricing/limits/terms with notice on this site.</li>
-    </ul>
-  </div>
-</div></body></html>
-"""
+TERMS_HTML = (
+    "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — Terms of Service")+"</head>"
+    "<body><div class='wrap'><header><img src='/logo.svg' alt='SheetsJSON logo' style='width:36px;height:36px;margin-right:8px'/>"
+    "<strong>SheetsJSON</strong></header><nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a>"
+    "<a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+    "<div class='card'><h1>Terms of Service</h1>"
+    "<ul><li><strong>Acceptable Use:</strong> Only use published Google Sheets CSV links.</li>"
+    "<li><strong>Rate Limits:</strong> We may throttle or block excessive requests.</li>"
+    "<li><strong>Availability:</strong> Service is provided “as is” without warranty. Free tier may sleep after inactivity.</li>"
+    "<li><strong>Liability:</strong> We’re not liable for lost data or downstream issues caused by your use of this service.</li>"
+    "<li><strong>Changes:</strong> We may change pricing/limits/terms with notice on this site.</li></ul>"
+    "</div></div></body></html>"
+)
 
-EXAMPLES_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Examples")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card"><h1>Examples</h1><p>These demo datasets are hosted on this domain so you can try filtering/sorting instantly.</p>
-    <div class="cards">
-      <div class="card">
-        <h3>Products</h3>
-        <p>Filter active items under $20 and sort by price.</p>
-        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/1&filter=status:active&filter=price%3C20&order=price%3Anum&autorun=1">Open in Playground →</a>
-      </div>
-      <div class="card">
-        <h3>Employees</h3>
-        <p>Select name, role, city. Sort by salary desc.</p>
-        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/2&select=name,role,city&order=-salary%3Anum&autorun=1">Open in Playground →</a>
-      </div>
-      <div class="card">
-        <h3>Events</h3>
-        <p>Show only open events, limit 2.</p>
-        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/3&filter=status:open&limit=2&autorun=1">Open in Playground →</a>
-      </div>
-    </div>
-    <p class="hint" style="margin-top:10px">Have a Sheet? Publish to web → CSV and paste the link on the Home page.</p>
-  </div>
-</div></body></html>
-"""
+def _examples_html() -> str:
+    return (
+        "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — Examples")+"</head>"
+        "<body><div class='wrap'><header><img src='/logo.svg' alt='SheetsJSON logo'/><strong>SheetsJSON</strong></header>"
+        "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a><a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+        "<div class='card'><h1>Examples</h1><p>These demo datasets are hosted on this domain so you can try filtering/sorting instantly.</p>"
+        "<div class='cards'>"
+        "<div class='card'><h3>Products</h3><p>Filter active items under $20 and sort by price.</p>"
+        "<a class='btn' href='/?csv="+PUBLIC_BASE_URL+"/demo/csv/1&filter=status%3Aactive&filter=price%3C20&order=price%3Anum&autorun=1'>Open in Playground →</a></div>"
+        "<div class='card'><h3>Employees</h3><p>Select name, role, city. Sort by salary desc.</p>"
+        "<a class='btn' href='/?csv="+PUBLIC_BASE_URL+"/demo/csv/2&select=name,role,city&order=-salary%3Anum&autorun=1'>Open in Playground →</a></div>"
+        "<div class='card'><h3>Events</h3><p>Show only open events, limit 2.</p>"
+        "<a class='btn' href='/?csv="+PUBLIC_BASE_URL+"/demo/csv/3&filter=status%3Aopen&limit=2&autorun=1'>Open in Playground →</a></div>"
+        "</div><p class='hint' style='margin-top:10px'>Have a Sheet? Publish to web → CSV and paste the link on the Home page.</p>"
+        "</div></div></body></html>"
+    )
 
-FAQ_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — FAQ")}</head>
-<body><div class="wrap">
-  <header><img src="/logo.svg" alt="SheetsJSON logo"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
-  <div class="card"><h1>FAQ</h1>
-    <h3>What links are allowed?</h3>
-    <p>Published Google Sheets CSV links (<em>File → Share → Publish to web → CSV</em>). For demos, we also allow <code>{PUBLIC_BASE_URL}/demo/csv/…</code>.</p>
-    <h3>Do you store my data?</h3>
-    <p>No sheet data is stored. We keep API keys and monthly usage counts. See <a href="/privacy">Privacy</a>.</p>
-    <h3>How do filters work?</h3>
-    <p>String: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>.<br/>Numeric: <code>col&gt;=n</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&lt;</code>. Sort: <code>order=price:num</code> or <code>-price:num</code>. Select columns with <code>select=col1,col2</code>.</p>
-    <h3>How do I publish to CSV?</h3>
-    <ol>
-      <li>Open your Google Sheet → File → <strong>Share</strong> → <strong>Publish to web</strong>.</li>
-      <li>Select the sheet/tab, choose <strong>CSV</strong>, and click <strong>Publish</strong>.</li>
-      <li>Ensure the link contains <code>/pub</code> and <code>output=csv</code>, then paste it on the Home page.</li>
-    </ol>
-    <h3>Is there caching?</h3>
-    <p>Yes. Server caches CSV for <code>CACHE_TTL_SECONDS</code> (default 300s). Client ETag supported—send <code>If-None-Match</code> to skip body.</p>
-    <h3>What are limits?</h3>
-    <p>Free: {PLANS['free']['monthly_limit']}/mo. Pro: {PLANS['pro']['monthly_limit']}/mo. Plus: {PLANS['plus']['monthly_limit']}/mo.</p>
-  </div>
-</div></body></html>
-"""
+FAQ_HTML = (
+    "<!doctype html><html lang='en'><head>"+_html_head("SheetsJSON — FAQ")+"</head>"
+    "<body><div class='wrap'><header><img src='/logo.svg' alt='SheetsJSON logo'/><strong>SheetsJSON</strong></header>"
+    "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a><a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a></nav>"
+    "<div class='card'><h1>FAQ</h1>"
+    "<h3>What links are allowed?</h3><p>Published Google Sheets CSV links (<em>File → Share → Publish to web → CSV</em>). For demos, we also allow <code>"+PUBLIC_BASE_URL+"/demo/csv/…</code>.</p>"
+    "<h3>Do you store my data?</h3><p>No sheet data is stored. We keep API keys and monthly usage counts. See <a href='/privacy'>Privacy</a>.</p>"
+    "<h3>How do filters work?</h3><p>String: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>.<br/>Numeric: <code>col&gt;=n</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&lt;</code>. Sort: <code>order=price:num</code> or <code>-price:num</code>. Select columns with <code>select=col1,col2</code>.</p>"
+    "<h3>How do I publish to CSV?</h3><ol>"
+    "<li>Open your Google Sheet → File → <strong>Share</strong> → <strong>Publish to web</strong>.</li>"
+    "<li>Select the sheet/tab, choose <strong>CSV</strong>, and click <strong>Publish</strong>.</li>"
+    "<li>Ensure the link contains <code>/pub</code> and <code>output=csv</code>, then paste it on the Home page.</li></ol>"
+    "<h3>Is there caching?</h3><p>Yes. Server caches CSV for <code>CACHE_TTL_SECONDS</code> (default 300s). Client ETag supported—send <code>If-None-Match</code> to skip body.</p>"
+    "<h3>What are limits?</h3><p>Free: "+str(PLANS['free']['monthly_limit'])+"/mo. Pro: "+str(PLANS['pro']['monthly_limit'])+"/mo. Plus: "+str(PLANS['plus']['monthly_limit'])+"/mo.</p>"
+    "</div></div></body></html>"
+)
 
 # ---------- Demo CSV endpoints ----------
 @app.get("/demo/csv/1", response_class=PlainTextResponse)
@@ -907,13 +867,13 @@ def demo_csv_3():
 
 # ---------- Routes: pages ----------
 @app.get("/", response_class=HTMLResponse)
-def home(): return HTMLResponse(HOME_HTML)
+def home(): return HTMLResponse(_home_html())
 
 @app.get("/examples", response_class=HTMLResponse)
-def examples_page(): return HTMLResponse(EXAMPLES_HTML)
+def examples_page(): return HTMLResponse(_examples_html())
 
 @app.get("/pricing", response_class=HTMLResponse)
-def pricing(): return HTMLResponse(PRICING_HTML)
+def pricing(): return HTMLResponse(_pricing_html())
 
 @app.get("/request-key", response_class=HTMLResponse)
 def request_key_form(): return HTMLResponse(REQUEST_KEY_HTML)
@@ -971,34 +931,46 @@ async def request_key_submit(
 
     key_text = issue_key(payload["plan"]) if KEY_AUTO_ISSUE else None
 
-    key_html = (f"<p>Your <strong>{PLANS[payload['plan']]['label']}</strong> API key:</p>"
-                f"<pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{key_text}</pre>"
-                f"<p class='hint'>Limit: {PLANS[payload['plan']]['monthly_limit']} requests / month. "
-                f"Use header <code>x-api-key</code> or query <code>?key=</code>.</p>") if key_text else "<p>We’ll email your key shortly.</p>"
+    if key_text:
+        key_html = (
+            "<p>Your <strong>"+PLANS[payload['plan']]['label']+"</strong> API key:</p>"
+            "<pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>"+key_text+"</pre>"
+            "<p class='hint'>Limit: "+str(PLANS[payload['plan']]['monthly_limit'])+" requests / month. "
+            "Use header <code>x-api-key</code> or query <code>?key=</code>.</p>"
+        )
+    else:
+        key_html = "<p>We’ll email your key shortly.</p>"
 
-    return HTMLResponse(f"""
-<!doctype html><meta charset="utf-8"><title>Thanks</title>
-<body style='font-family:system-ui;padding:2rem;background:#0b1020;color:#eef2ff'>
-  <h2>Thanks — your request was received.</h2>
-  {key_html}
-  <p><a style='color:#9cc2ff' href='/'>← Back to Home</a></p>
-</body>""", status_code=200)
+    return HTMLResponse(
+        "<!doctype html><meta charset='utf-8'><title>Thanks</title>"
+        "<body style='font-family:system-ui;padding:2rem;background:#0b1020;color:#eef2ff'>"
+        "<h2>Thanks — your request was received.</h2>"
+        + key_html +
+        "<p><a style='color:#9cc2ff' href='/'>← Back to Home</a></p></body>",
+        status_code=200
+    )
 
-# ---------- SEO: robots & sitemap ----------
+# ---------- SEO: robots & sitemap (auto-detect host) ----------
 @app.get("/robots.txt", response_class=PlainTextResponse, tags=["SEO"])
-def robots():
-    return PlainTextResponse(f"User-agent: *\nAllow: /\nSitemap: {PUBLIC_BASE_URL}/sitemap.xml\n")
+def robots(request: Request):
+    base = PUBLIC_BASE_URL or urlunsplit((request.url.scheme, request.url.netloc, "", "", ""))
+    return PlainTextResponse("User-agent: *\nAllow: /\nSitemap: " + base + "/sitemap.xml\n")
 
 @app.get("/sitemap.xml", tags=["SEO"])
-def sitemap():
+def sitemap(request: Request):
+    base = PUBLIC_BASE_URL or urlunsplit((request.url.scheme, request.url.netloc, "", "", ""))
     urls = ["/", "/examples", "/pricing", "/usage", "/faq", "/privacy", "/terms"]
-    items = "".join(f"<url><loc>{PUBLIC_BASE_URL}{p}</loc></url>" for p in urls if PUBLIC_BASE_URL)
-    xml = f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{items}</urlset>'
+    items = "".join("<url><loc>"+base+p+"</loc></url>" for p in urls)
+    xml = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+        + items + "</urlset>"
+    )
     return FastAPIResponse(content=xml, media_type="application/xml")
 
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.12.0"}
+def healthz(): return {"ok": True, "version": "0.13.0"}
 
 # ---------- API ----------
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
@@ -1052,8 +1024,8 @@ def usage(
 # ---------- Admin (HTTP Basic) ----------
 security = HTTPBasic()
 def admin_guard(credentials: HTTPBasicCredentials = Depends(security)):
-    u_ok = secrets.compare_digest(credentials.username, ADMIN_USER)
-    p_ok = secrets.compare_digest(credentials.password, ADMIN_PASS)
+    u_ok = secrets.compareDigest(credentials.username, ADMIN_USER) if hasattr(secrets, "compareDigest") else secrets.compare_digest(credentials.username, ADMIN_USER)
+    p_ok = secrets.compareDigest(credentials.password, ADMIN_PASS) if hasattr(secrets, "compareDigest") else secrets.compare_digest(credentials.password, ADMIN_PASS)
     if not (u_ok and p_ok):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
@@ -1067,34 +1039,35 @@ def admin_keys_page(auth: bool = Depends(admin_guard)):
     rows = []
     for item in items:
         k = item["api_key"]; plan = item["plan"]; lim = item["monthly_limit"]
-        rows.append(f"<tr><td><code>{k}</code></td><td>{plan}</td><td>{lim}</td>"
-                    f"<td><form method='post' action='/admin/keys/update' style='display:inline'>"
-                    f"<input type='hidden' name='api_key' value='{k}'/>"
-                    f"<select name='plan'><option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select>"
-                    f"<input name='monthly_limit' type='number' placeholder='(keep)' style='width:120px'/>"
-                    f"<button class='btn' type='submit'>Update</button></form> "
-                    f"<form method='post' action='/admin/keys/revoke' style='display:inline;margin-left:6px'>"
-                    f"<input type='hidden' name='api_key' value='{k}'/><button class='btn' type='submit'>Revoke</button></form></td></tr>")
+        rows.append(
+            "<tr><td><code>"+k+"</code></td><td>"+str(plan)+"</td><td>"+str(lim)+"</td>"
+            "<td><form method='post' action='/admin/keys/update' style='display:inline'>"
+            "<input type='hidden' name='api_key' value='"+k+"'/><select name='plan'>"
+            "<option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select>"
+            "<input name='monthly_limit' type='number' placeholder='(keep)' style='width:120px'/>"
+            "<button class='btn' type='submit'>Update</button></form> "
+            "<form method='post' action='/admin/keys/revoke' style='display:inline;margin-left:6px'>"
+            "<input type='hidden' name='api_key' value='"+k+"'/><button class='btn' type='submit'>Revoke</button></form></td></tr>"
+        )
     table = "\n".join(rows) or "<tr><td colspan='4'><em>No keys yet.</em></td></tr>"
-    html = f"""<!doctype html><html><head>{_html_head("Admin — Keys")}</head><body>
-    <div class='wrap'><div class='card'>
-      <h1>Admin — Keys</h1>
-      <form method='post' action='/admin/keys/mint' style='margin:8px 0'>
-        <strong>Mint:</strong> plan
-        <select name='plan'><option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select>
-        limit <input name='monthly_limit' type='number' placeholder='(default)' style='width:120px'/>
-        <button class='btn' type='submit'>Create</button>
-      </form>
-      <table><thead><tr><th>API key</th><th>Plan</th><th>Monthly limit</th><th>Actions</th></tr></thead><tbody>
-        {table}
-      </tbody></table>
-    </div></div></body></html>"""
+    html = (
+        "<!doctype html><html><head>"+_html_head("Admin — Keys")+"</head><body>"
+        "<div class='wrap'><div class='card'><h1>Admin — Keys</h1>"
+        "<form method='post' action='/admin/keys/mint' style='margin:8px 0'>"
+        "<strong>Mint:</strong> plan "
+        "<select name='plan'><option value='free'>free</option><option value='pro'>pro</option><option value='plus'>plus</option></select> "
+        "limit <input name='monthly_limit' type='number' placeholder='(default)' style='width:120px'/> "
+        "<button class='btn' type='submit'>Create</button></form>"
+        "<table><thead><tr><th>API key</th><th>Plan</th><th>Monthly limit</th><th>Actions</th></tr></thead><tbody>"
+        + table +
+        "</tbody></table></div></div></body></html>"
+    )
     return HTMLResponse(html)
 
 @app.post("/admin/keys/mint", tags=["Admin"])
 def admin_mint_key(plan: str = Form("free"), monthly_limit: Optional[int] = Form(None), auth: bool = Depends(admin_guard)):
     k = issue_key(plan, monthly_limit)
-    return PlainTextResponse(f"Created key: {k}\n\nGo back: /admin/keys")
+    return PlainTextResponse("Created key: " + k + "\n\nGo back: /admin/keys")
 
 @app.post("/admin/keys/update", tags=["Admin"])
 def admin_update_key(api_key: str = Form(...), plan: str = Form("free"), monthly_limit: Optional[int] = Form(None), auth: bool = Depends(admin_guard)):
@@ -1123,7 +1096,7 @@ def admin_revoke_key(api_key: str = Form(...), auth: bool = Depends(admin_guard)
             save_keys_file(keys)
     return PlainTextResponse("Revoked (if it existed).\n\nGo back: /admin/keys")
 
-# ---------- Billing ----------
+# ---------- Billing (Stripe) ----------
 def orders_insert(session_id: str, email: Optional[str], plan: str,
                   api_key: Optional[str], status: str,
                   customer_id: Optional[str] = None, subscription_id: Optional[str] = None):
@@ -1138,6 +1111,7 @@ def orders_insert(session_id: str, email: Optional[str], plan: str,
                      subscription_id=COALESCE(orders.subscription_id, EXCLUDED.subscription_id)"""
             cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z", customer_id, subscription_id))
         else:
+            # SQLite upsert-ish
             existing = orders_get(session_id)
             if existing:
                 q = """UPDATE orders SET email=?, plan=?, api_key=COALESCE(api_key, ?), status=?,
@@ -1165,17 +1139,11 @@ def orders_find_by_customer(customer_id: str) -> Optional[Dict]:
         cur = con.cursor()
         if DB_IS_PG:
             q = """SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id
-                   FROM orders
-                   WHERE customer_id=%s
-                   ORDER BY created_at DESC
-                   LIMIT 1"""
+                   FROM orders WHERE customer_id=%s ORDER BY created_at DESC LIMIT 1"""
             cur.execute(q, (customer_id,))
         else:
             q = """SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id
-                   FROM orders
-                   WHERE customer_id=?
-                   ORDER BY created_at DESC
-                   LIMIT 1"""
+                   FROM orders WHERE customer_id=? ORDER BY created_at DESC LIMIT 1"""
             cur.execute(q, (customer_id,))
         row = cur.fetchone()
         if not row:
@@ -1195,17 +1163,17 @@ def orders_find_by_customer(customer_id: str) -> Optional[Dict]:
 def billing_checkout(plan: str = Form(...)):
     if not SUBSCRIBE_ENABLED:
         raise HTTPException(status_code=503, detail="Stripe not configured")
-    plan = (plan or "").lower()
-    if plan not in ("pro", "plus"):
+    plan_l = (plan or "").lower()
+    if plan_l not in ("pro", "plus"):
         raise HTTPException(status_code=400, detail="Invalid plan")
-    price_id = STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PLUS
+    price_id = STRIPE_PRICE_PRO if plan_l == "pro" else STRIPE_PRICE_PLUS
     params = dict(
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
         allow_promotion_codes=True,
         success_url=f"{PUBLIC_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{PUBLIC_BASE_URL}/pricing",
-        metadata={"plan": plan},
+        metadata={"plan": plan_l},
     )
     if STRIPE_AUTOMATIC_TAX:
         params["automatic_tax"] = {"enabled": True}
@@ -1213,7 +1181,7 @@ def billing_checkout(plan: str = Form(...)):
         session = stripe.checkout.Session.create(**params)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
-    return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")
+    return HTMLResponse(f"<!doctype html><meta charset='utf-8'><script>location.href='{session.url}';</script>")
 
 # Customer Portal (Manage billing)
 @app.post("/billing/portal", tags=["Billing"])
@@ -1227,33 +1195,32 @@ def billing_portal(session_id: str = Form(...)):
         customer=rec["customer_id"],
         return_url=f"{PUBLIC_BASE_URL}/pricing"
     )
-    return HTMLResponse(f'<!doctype html><meta charset="utf-8"><script>location.href="{sess.url}";</script>')
+    return HTMLResponse('<!doctype html><meta charset="utf-8"><script>location.href="'+sess.url+'";</script>')
 
 @app.get("/billing/success", response_class=HTMLResponse, tags=["Billing"])
 def billing_success(session_id: str = Query(...)):
     rec = orders_get(session_id)
     if rec and rec.get("api_key"):
-        key_html = f"<p>Your <strong>{PLANS[rec['plan']]['label']}</strong> API key:</p><pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{rec['api_key']}</pre><p class='hint'>Stored for {rec.get('email') or '(no email)' }.</p>"
+        key_html = (
+            "<p>Your <strong>"+PLANS[rec['plan']]['label']+"</strong> API key:</p>"
+            "<pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>"+rec['api_key']+"</pre>"
+            "<p class='hint'>Stored for "+(rec.get("email") or "(no email)")+".</p>"
+        )
     else:
         key_html = "<p>Thanks! We’re finalizing your subscription. This page will show your key as soon as the payment completes—refresh in a few seconds.</p>"
     plan_js = (rec.get("plan","") if rec else "")
-    return HTMLResponse(f"""<!doctype html><html><head>{_html_head("SheetsJSON — Thanks!")}</head>
-<body><div class="wrap"><div class="card">
-  <h1>Payment successful</h1>
-  {key_html}
-  <form method="post" action="/billing/portal" style="display:inline">
-    <input type="hidden" name="session_id" value="{session_id}"/>
-    <button class="btn" type="submit">Manage billing</button>
-  </form>
-  <a class="btn" style="margin-left:8px" href="/">Go to Home</a>
-  <a class="btn" style="margin-left:8px" href="/pricing">Docs</a>
-</div></div>
-<script>
-  if (window.plausible) {{
-    plausible('SubscribeSuccess', {{props: {{plan: '{plan_js}'}}}});
-  }}
-</script>
-</body></html>""")
+    return HTMLResponse(
+        "<!doctype html><html><head>"+_html_head("SheetsJSON — Thanks!")+"</head>"
+        "<body><div class='wrap'><div class='card'>"
+        "<h1>Payment successful</h1>"+key_html+
+        "<form method='post' action='/billing/portal' style='display:inline'>"
+        "<input type='hidden' name='session_id' value='"+session_id+"'/><button class='btn' type='submit'>Manage billing</button></form>"
+        "<a class='btn' style='margin-left:8px' href='/'>Go to Home</a>"
+        "<a class='btn' style='margin-left:8px' href='/pricing'>Docs</a>"
+        "</div></div>"
+        "<script>if(window.plausible){plausible('SubscribeSuccess',{props:{plan:'"+plan_js+"'}});}</script>"
+        "</body></html>"
+    )
 
 @app.post("/stripe/webhook", tags=["Billing"])
 async def stripe_webhook(request: Request):
@@ -1286,12 +1253,12 @@ async def stripe_webhook(request: Request):
         if SMTP_HOST and SMTP_USER and SMTP_PASS and email:
             try:
                 msg = EmailMessage()
-                msg["Subject"] = f"Your SheetsJSON {PLANS[plan]['label']} API Key"
+                msg["Subject"] = "Your SheetsJSON "+PLANS[plan]["label"]+" API Key"
                 msg["From"] = SMTP_USER; msg["To"] = email
                 msg.set_content(
-                    f"Thanks for subscribing to SheetsJSON ({plan}).\n\n"
-                    f"Here is your API key:\n\n{k}\n\n"
-                    f"Docs: {PUBLIC_BASE_URL}/pricing\nUsage: {PUBLIC_BASE_URL}/usage\n"
+                    "Thanks for subscribing to SheetsJSON ("+plan+").\n\n"
+                    "Here is your API key:\n\n"+k+"\n\n"
+                    "Docs: "+PUBLIC_BASE_URL+"/pricing\nUsage: "+PUBLIC_BASE_URL+"/usage\n"
                 )
                 with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s2:
                     s2.starttls(); s2.login(SMTP_USER, SMTP_PASS); s2.send_message(msg)
@@ -1332,6 +1299,11 @@ async def stripe_webhook(request: Request):
 @app.on_event("startup")
 def _startup():
     db_init()
+
+# ---------- Health/debug (optional) ----------
+@app.get("/_debug/routes")
+def _debug_routes():
+    return [{"path": r.path, "methods": sorted(list(getattr(r, "methods", [])))} for r in app.routes]
 
 if __name__ == "__main__":
     uvicorn_run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

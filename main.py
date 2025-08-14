@@ -702,6 +702,7 @@ $("check").addEventListener("click", run);
 )
 
 
+
 PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Privacy Policy")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>

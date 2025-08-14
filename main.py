@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response as FastAPIRes
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.middleware.base import BaseHTTPMiddleware
 from uvicorn import run as uvicorn_run
+from fastapi.responses import RedirectResponse
 
 import sqlite3
 try:
@@ -130,12 +131,13 @@ class SecurityHeaders(BaseHTTPMiddleware):
         # Allow Plausible if configured
         if PLAUSIBLE_DOMAIN:
             resp.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "img-src 'self' data:; "
-                "style-src 'self' 'unsafe-inline'; "
-                "script-src 'self' https://plausible.io; "
-                "connect-src 'self' https://plausible.io;"
-            )
+                        "default-src 'self'; "
+                        "img-src 'self' data:; "
+                        "style-src 'self' 'unsafe-inline'; "
+                        "script-src 'self' 'unsafe-inline' https://plausible.io; "
+                        "connect-src 'self' https://plausible.io;"
+                        )
+
         return resp
 
 app.add_middleware(SecurityHeaders)
@@ -1181,7 +1183,8 @@ def billing_checkout(plan: str = Form(...)):
         session = stripe.checkout.Session.create(**params)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
-    return HTMLResponse(f"<!doctype html><meta charset='utf-8'><script>location.href='{session.url}';</script>")
+    #return HTMLResponse(f"<!doctype html><meta charset='utf-8'><script>location.href='{session.url}';</script>")
+    return RedirectResponse(url=session.url, status_code=303)
 
 # Customer Portal (Manage billing)
 @app.post("/billing/portal", tags=["Billing"])
@@ -1195,7 +1198,8 @@ def billing_portal(session_id: str = Form(...)):
         customer=rec["customer_id"],
         return_url=f"{PUBLIC_BASE_URL}/pricing"
     )
-    return HTMLResponse('<!doctype html><meta charset="utf-8"><script>location.href="'+sess.url+'";</script>')
+    #return HTMLResponse('<!doctype html><meta charset="utf-8"><script>location.href="'+sess.url+'";</script>')
+    return RedirectResponse(url=sess.url, status_code=303)
 
 @app.get("/billing/success", response_class=HTMLResponse, tags=["Billing"])
 def billing_success(session_id: str = Query(...)):

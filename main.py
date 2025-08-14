@@ -22,7 +22,7 @@ import stripe
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.10.0",
+    version="0.11.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
@@ -85,6 +85,21 @@ CANCEL_DOWNGRADE_PLAN = os.getenv("CANCEL_DOWNGRADE_PLAN", "free").lower()
 SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL)
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+
+# --- Analytics / host info ---
+PLAUSIBLE_DOMAIN = os.getenv("PLAUSIBLE_DOMAIN", "").strip()
+PUBLIC_HOST = ""
+try:
+    if PUBLIC_BASE_URL:
+        PUBLIC_HOST = urlparse(PUBLIC_BASE_URL).netloc
+except Exception:
+    PUBLIC_HOST = ""
+
+def _analytics_snippet() -> str:
+    if not PLAUSIBLE_DOMAIN:
+        return ""
+    # Plausible: privacy-friendly, no cookies
+    return f'<script defer data-domain="{PLAUSIBLE_DOMAIN}" src="https://plausible.io/js/script.js"></script>'
 
 # ---------- In-memory cache & rate limit ----------
 _cache: Dict[str, Dict] = {}
@@ -362,13 +377,19 @@ def validate_csv_url(csv_url: str):
         raise HTTPException(status_code=400, detail="Invalid csv_url")
     if u.scheme != "https":
         raise HTTPException(status_code=400, detail="csv_url must be https")
+
+    # Allow our own demo CSV endpoints (e.g., https://yourdomain/demo/csv/1)
+    if PUBLIC_HOST and u.netloc == PUBLIC_HOST and u.path.startswith("/demo/csv/"):
+        return
+
+    # Default: only allow published Google Sheets CSV
     if not (u.netloc.endswith("docs.google.com")):
         raise HTTPException(status_code=400, detail="Only Google Sheets 'Publish to web → CSV' links are allowed")
+    if "/pub" not in u.path:
+        raise HTTPException(status_code=400, detail="csv_url must be a published CSV (path should contain /pub)")
     qs = parse_qs(u.query)
     if "output" not in qs or "csv" not in [v.lower() for v in qs["output"]]:
         raise HTTPException(status_code=400, detail="csv_url must include output=csv")
-    if "/pub" not in u.path:
-        raise HTTPException(status_code=400, detail="csv_url must be a published CSV (path should contain /pub)")
 
 # ---------- CSV fetch ----------
 def fetch_csv_rows(csv_url: str, bypass_cache: bool = False) -> Tuple[List[Dict[str, str]], str]:
@@ -487,6 +508,7 @@ def _html_head(title: str) -> str:
     return f"""
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>{title}</title><link rel="icon" href="/favicon.svg">
+{_analytics_snippet()}
 <style>
   :root{{--bg:#0b1020;--card:#121933;--muted:#8da2d0;--text:#eef2ff;--accent:#6ea8fe;}}
   *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto}}
@@ -510,14 +532,15 @@ def _html_head(title: str) -> str:
   .plan h3{{margin:0 0 6px}} .cta{{margin-top:8px}}
   table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1px solid #233366;text-align:left}}
   .btn{{display:inline-block;padding:8px 12px;border-radius:8px;border:1px solid #233366;background:#0e1630;color:#eaf0ff;text-decoration:none}}
+  .cards{{display:grid;gap:12px}} @media(min-width:820px){{.cards{{grid-template-columns:repeat(3,1fr)}}}}
 </style>"""
 
 # ---------- Pages ----------
 HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — CSV → JSON API")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo"/><div><strong>SheetsJSON</strong><br/><small class="hint">Google Sheets → JSON API</small></div></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
-  <div class="card"><h1>Try it now</h1><p>Paste a Google Sheets <strong>Publish to web → CSV</strong> link, your API key, and press Fetch.</p>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
+  <div class="card"><h1>Try it now</h1><p>Paste a Google Sheets <strong>Publish to web → CSV</strong> link (or click an example), add your API key, and press Fetch.</p>
     <div class="grid"><div>
       <label>Google Sheets CSV URL</label><input id="csv" placeholder="https://docs.google.com/.../pub?output=csv"/>
       <label>API key <small class="hint">(header <code>x-api-key</code> or <code>?key=</code>)</small></label><input id="key" placeholder="FREE_EXAMPLE_KEY_123"/>
@@ -529,7 +552,7 @@ HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON —
       <textarea id="filters" placeholder="status:active&#10;name~ali&#10;age&gt;=21&#10;price&lt;100"></textarea>
       <small class="hint">Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>
       <div class="row" style="margin-top:8px"><button id="go" type="button">Fetch JSON</button><button id="usage" type="button">Check Usage</button></div>
-      <div id="status">Ready.</div><small class="hint">Need a key? <a href="/request-key">Request one</a>.</small></div>
+      <div id="status">Ready.</div><small class="hint">Need a key? <a href="/request-key">Request one</a>. See <a href="/examples">Examples</a>.</small></div>
       <div><label>Result</label><pre id="out">Waiting…</pre><label>Curl</label><pre id="curl"># will appear after a request</pre><label>ETag</label><pre id="etag"># returns entity tag for caching</pre></div>
     </div>
   </div>
@@ -540,7 +563,7 @@ const $ = (id) => document.getElementById(id);
 function buildURL() {{
   const u = new URL(window.location.origin + "/v1/fetch");
   const filters = $("filters").value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
-  u.searchParams.set("csv_url", $("csv").value.trim());
+  const csv = $("csv").value.trim(); if (csv) u.searchParams.set("csv_url", csv);
   const sel = $("select").value.trim(); if (sel) u.searchParams.set("select", sel);
   const ord = $("order").value.trim();  if (ord) u.searchParams.set("order", ord);
   const lim = $("limit").value.trim();  if (lim) u.searchParams.set("limit", lim);
@@ -570,7 +593,16 @@ async function runUsage() {{
     const text = await res.text(); try {{ $("out").textContent = JSON.stringify(JSON.parse(text), null, 2); }} catch {{ $("out").textContent = text; }}
   }} catch (e) {{ $("status").textContent = "Error"; $("out").textContent = "Error: " + e; console.error(e); }}
 }}
+function prefillFromQuery(){{
+  const q = new URLSearchParams(location.search);
+  const map = [ ["csv","csv"], ["key","key"], ["select","select"], ["order","order"], ["limit","limit"], ["offset","offset"] ];
+  map.forEach(([qs,id])=>{{ const v=q.get(qs); if(v!==null) $(id).value=v; }});
+  const filters = q.getAll("filter");
+  if(filters.length) $("filters").value = filters.join("\\n");
+  if(q.get("autorun")==="1") runFetch();
+}}
 $("go").addEventListener("click", runFetch); $("usage").addEventListener("click", runUsage);
+prefillFromQuery();
 </script></body></html>
 """
 
@@ -580,7 +612,7 @@ def fmt_price(n: int) -> str:
 PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Pricing & Docs")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
   <div class="card"><h1>Pricing</h1>
     <div class="pricegrid">
       <div class="plan"><h3>{PLANS['free']['label']}</h3>
@@ -618,7 +650,7 @@ PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
 REQUEST_KEY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Request a Key")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
   <div class="card"><h1>Request an API Key</h1>
     <p class="hint">Free keys are issued automatically. Pro/Plus keys are also issued here for demo purposes.</p>
     <form method="post" action="/request-key">
@@ -647,7 +679,7 @@ USAGE_HTML = (
     + """
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
   <div class="card">
     <h1>Check your usage</h1>
     <label>API key</label>
@@ -703,7 +735,7 @@ $("check").addEventListener("click", run);
 PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Privacy Policy")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
   <div class="card">
     <h1>Privacy Policy</h1>
     <ul>
@@ -719,7 +751,7 @@ PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
 TERMS_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Terms of Service")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
-  <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
   <div class="card">
     <h1>Terms of Service</h1>
     <ul>
@@ -733,9 +765,98 @@ TERMS_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON �
 </div></body></html>
 """
 
+EXAMPLES_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Examples")}</head>
+<body><div class="wrap">
+  <header><img src="/logo.svg" alt="SheetsJSON logo"/><strong>SheetsJSON</strong></header>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
+  <div class="card"><h1>Examples</h1><p>These demo datasets are hosted on this domain so you can try filtering/sorting instantly.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Products</h3>
+        <p>Filter active items under $20 and sort by price.</p>
+        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/1&filter=status:active&filter=price%3C20&order=price%3Anum&autorun=1">Open in Playground →</a>
+      </div>
+      <div class="card">
+        <h3>Employees</h3>
+        <p>Select name, role, city. Sort by salary desc.</p>
+        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/2&select=name,role,city&order=-salary%3Anum&autorun=1">Open in Playground →</a>
+      </div>
+      <div class="card">
+        <h3>Events</h3>
+        <p>Show only open events, limit 2.</p>
+        <a class="btn" href="/?csv={PUBLIC_BASE_URL}/demo/csv/3&filter=status:open&limit=2&autorun=1">Open in Playground →</a>
+      </div>
+    </div>
+    <p class="hint" style="margin-top:10px">Have a Sheet? Publish to web → CSV and paste the link on the Home page.</p>
+  </div>
+</div></body></html>
+"""
+
+FAQ_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — FAQ")}</head>
+<body><div class="wrap">
+  <header><img src="/logo.svg" alt="SheetsJSON logo"/><strong>SheetsJSON</strong></header>
+  <nav><a href="/">Home</a><a href="/examples">Examples</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a><a href="/faq">FAQ</a></nav>
+  <div class="card"><h1>FAQ</h1>
+    <h3>What links are allowed?</h3>
+    <p>Published Google Sheets CSV links (<em>File → Share → Publish to web → CSV</em>). For demos, we also allow <code>{PUBLIC_BASE_URL}/demo/csv/…</code>.</p>
+    <h3>Do you store my data?</h3>
+    <p>No sheet data is stored. We keep API keys and monthly usage counts. See <a href="/privacy">Privacy</a>.</p>
+    <h3>How do filters work?</h3>
+    <p>String: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>.<br/>Numeric: <code>col&gt;=n</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&lt;</code>. Sort: <code>order=price:num</code> or <code>-price:num</code>. Select columns with <code>select=col1,col2</code>.</p>
+    <h3>Is there caching?</h3>
+    <p>Yes. Server caches CSV for <code>CACHE_TTL_SECONDS</code> (default 300s). Client ETag supported—send <code>If-None-Match</code> to skip body.</p>
+    <h3>What are limits?</h3>
+    <p>Free: {PLANS['free']['monthly_limit']}/mo. Pro: {PLANS['pro']['monthly_limit']}/mo. Plus: {PLANS['plus']['monthly_limit']}/mo.</p>
+    <h3>Why is my CSV not accepted?</h3>
+    <p>Ensure it’s <code>https://docs.google.com/.../pub?output=csv</code>. If you see “must include output=csv” or “/pub missing”, republish correctly.</p>
+    <h3>Can I use GitHub raw CSV?</h3>
+    <p>For security, production API only allows Google Sheets. Use the demo datasets for testing.</p>
+  </div>
+</div></body></html>
+"""
+
+# ---------- Demo CSV endpoints ----------
+@app.get("/demo/csv/1", response_class=PlainTextResponse)
+def demo_csv_1():
+    return PlainTextResponse(
+        "id,name,category,price,status\n"
+        "1,Widget A,Gadgets,19.99,active\n"
+        "2,Widget B,Gadgets,24.50,active\n"
+        "3,Thing C,Tools,8.00,archived\n"
+        "4,Thing D,Tools,12.25,active\n"
+        "5,Gizmo E,Accessories,5.50,active\n",
+        media_type="text/csv"
+    )
+
+@app.get("/demo/csv/2", response_class=PlainTextResponse)
+def demo_csv_2():
+    return PlainTextResponse(
+        "id,name,role,city,salary\n"
+        "101,Alice Johnson,Engineer,Denver,115000\n"
+        "102,Bob Smith,Designer,Austin,98000\n"
+        "103,Carla Reyes,Engineer,NYC,142000\n"
+        "104,David Kim,Support,Remote,70000\n"
+        "105,Erin Patel,PM,NYC,128000\n",
+        media_type="text/csv"
+    )
+
+@app.get("/demo/csv/3", response_class=PlainTextResponse)
+def demo_csv_3():
+    return PlainTextResponse(
+        "date,title,city,seats,status\n"
+        "2025-08-01,Launch Party,New York,120,open\n"
+        "2025-08-05,Webinar: Sheets → JSON,Online,500,open\n"
+        "2025-08-10,Meetup,Denver,80,waitlist\n"
+        "2025-08-15,Workshop,Austin,40,cancelled\n",
+        media_type="text/csv"
+    )
+
 # ---------- Routes: pages ----------
 @app.get("/", response_class=HTMLResponse)
 def home(): return HTMLResponse(HOME_HTML)
+
+@app.get("/examples", response_class=HTMLResponse)
+def examples_page(): return HTMLResponse(EXAMPLES_HTML)
 
 @app.get("/pricing", response_class=HTMLResponse)
 def pricing(): return HTMLResponse(PRICING_HTML)
@@ -751,6 +872,9 @@ def privacy_page(): return HTMLResponse(PRIVACY_HTML)
 
 @app.get("/terms", response_class=HTMLResponse)
 def terms_page(): return HTMLResponse(TERMS_HTML)
+
+@app.get("/faq", response_class=HTMLResponse)
+def faq_page(): return HTMLResponse(FAQ_HTML)
 
 # ---------- Key request (demo flow) ----------
 @app.post("/request-key")
@@ -808,7 +932,7 @@ async def request_key_submit(
 
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.10.0"}
+def healthz(): return {"ok": True, "version": "0.11.0"}
 
 # ---------- API ----------
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
@@ -1000,7 +1124,6 @@ def orders_find_by_customer(customer_id: str) -> Optional[Dict]:
             "customer_id": row[6],
             "subscription_id": row[7],
         }
-
 
 @app.post("/billing/checkout", tags=["Billing"])
 def billing_checkout(plan: str = Form(...)):

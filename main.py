@@ -973,14 +973,34 @@ def orders_get(session_id: str) -> Optional[Dict]:
 def orders_find_by_customer(customer_id: str) -> Optional[Dict]:
     with db_conn() as con:
         cur = con.cursor()
-        q = "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE customer_id=%s ORDER BY created_at DESC LIMIT 1" if DB_IS_PG else \
-            "SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id FROM orders WHERE customer_id=? ORDER BY created_at DESC LIMIT 1"
-    ...
-        cur.execute(q, (customer_id,))
+        if DB_IS_PG:
+            q = """SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id
+                   FROM orders
+                   WHERE customer_id=%s
+                   ORDER BY created_at DESC
+                   LIMIT 1"""
+            cur.execute(q, (customer_id,))
+        else:
+            q = """SELECT session_id,email,plan,api_key,status,created_at,customer_id,subscription_id
+                   FROM orders
+                   WHERE customer_id=?
+                   ORDER BY created_at DESC
+                   LIMIT 1"""
+            cur.execute(q, (customer_id,))
         row = cur.fetchone()
-        if not row: return None
-        return {"session_id": row[0], "email": row[1], "plan": row[2], "api_key": row[3], "status": row[4], "created_at": row[5],
-                "customer_id": row[6], "subscription_id": row[7]}
+        if not row:
+            return None
+        return {
+            "session_id": row[0],
+            "email": row[1],
+            "plan": row[2],
+            "api_key": row[3],
+            "status": row[4],
+            "created_at": row[5],
+            "customer_id": row[6],
+            "subscription_id": row[7],
+        }
+
 
 @app.post("/billing/checkout", tags=["Billing"])
 def billing_checkout(plan: str = Form(...)):

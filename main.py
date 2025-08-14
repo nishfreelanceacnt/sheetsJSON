@@ -78,6 +78,7 @@ STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY")        # sk_test_...
 STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO")         # price_...
 STRIPE_PRICE_PLUS     = os.getenv("STRIPE_PRICE_PLUS")        # price_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")    # whsec_...
+STRIPE_AUTOMATIC_TAX = os.getenv("STRIPE_AUTOMATIC_TAX", "0").lower() in ("1","true","yes","on")
 PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL)
 if STRIPE_SECRET_KEY:
@@ -948,15 +949,19 @@ def billing_checkout(plan: str = Form(...)):
         raise HTTPException(status_code=400, detail="Invalid plan")
     price_id = STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PLUS
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
-            allow_promotion_codes=True,
-            success_url=f"{PUBLIC_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{PUBLIC_BASE_URL}/pricing",
-            metadata={"plan": plan},
-            automatic_tax={"enabled": True},
+        params = dict(
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        allow_promotion_codes=True,
+        success_url=f"{PUBLIC_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{PUBLIC_BASE_URL}/pricing",
+        metadata={"plan": plan},
         )
+        if STRIPE_AUTOMATIC_TAX:
+            params["automatic_tax"] = {"enabled": True}
+
+        session = stripe.checkout.Session.create(**params)
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
     return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")

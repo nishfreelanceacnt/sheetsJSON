@@ -1,6 +1,5 @@
 import os, time, io, csv, json, requests, datetime, re, hashlib, smtplib, uuid, secrets
 from typing import List, Dict, Optional, Tuple
-
 from email.message import EmailMessage
 from urllib.parse import urlparse, parse_qs
 
@@ -11,46 +10,44 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response as FastAPIRes
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from uvicorn import run as uvicorn_run
 
-# Optional DB drivers
 import sqlite3
 try:
-    import psycopg2  # for Postgres
+    import psycopg2
     HAS_PG = True
 except Exception:
     HAS_PG = False
 
+import stripe
+
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.8.0",
+    version="0.9.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
         {"name": "Admin", "description": "Key management"},
+        {"name": "Billing", "description": "Stripe checkout & webhook"},
         {"name": "Pages", "description": "Public pages"},
     ],
 )
 app.add_middleware(GZipMiddleware)
 
-# CORS (configurable)
+# CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
-if CORS_ALLOW_ORIGINS.strip() == "*":
-    cors_origins = ["*"]
-else:
-    cors_origins = [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+cors_origins = ["*"] if CORS_ALLOW_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Config ----------
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "true").lower() in ("1", "true", "yes")
 
-# Key storage backend: "db" (Postgres/SQLite) or "file"
-KEYS_BACKEND = os.getenv("KEYS_BACKEND", "db").lower()  # default to db for durability
-KEYS_PATH = os.getenv("KEYS_PATH", "keys.json")         # used only if KEYS_BACKEND="file"
+# Storage backends
+KEYS_BACKEND = os.getenv("KEYS_BACKEND", "db").lower()
+KEYS_PATH = os.getenv("KEYS_PATH", "keys.json")
 
-# Usage DB (always DB-backed for durability when DATABASE_URL is set)
 USAGE_DB = os.getenv("USAGE_DB_PATH", "usage.db")
-DATABASE_URL = os.getenv("DATABASE_URL")  # if present → use Postgres
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_IS_PG = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
 # Key request handling
@@ -58,48 +55,54 @@ KEY_REQUEST_MODE = os.getenv("KEY_REQUEST_MODE", "file")  # 'file' or 'email'
 KEY_REQUEST_FILE = os.getenv("KEY_REQUEST_FILE", "key_requests.jsonl")
 KEY_AUTO_ISSUE = os.getenv("KEY_AUTO_ISSUE", "true").lower() in ("1", "true", "yes")
 
-# Email settings (only used if KEY_REQUEST_MODE='email')
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
-KEY_REQUEST_TO = os.getenv("KEY_REQUEST_TO", SMTP_USER)  # recipient
+KEY_REQUEST_TO = os.getenv("KEY_REQUEST_TO", SMTP_USER)
 
 # Admin + rate-limit
 ADMIN_USER = os.getenv("ADMIN_USER") or "admin"
 ADMIN_PASS = os.getenv("ADMIN_PASS") or "change-me"
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "90"))
 
-# Plans & limits (also shown on /pricing)
+# Plans
 PLANS = {
     "free": {"price": 0, "monthly_limit": 200,   "label": "Free"},
     "pro":  {"price": 9, "monthly_limit": 5000,  "label": "Pro"},
     "plus": {"price": 19,"monthly_limit": 25000, "label": "Plus"},
 }
 
+# Stripe config
+STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY")        # sk_test_...
+STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO")         # price_...
+STRIPE_PRICE_PLUS     = os.getenv("STRIPE_PRICE_PLUS")        # price_...
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")    # whsec_...
+PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL)
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
 # ---------- In-memory cache & rate limit ----------
-_cache: Dict[str, Dict] = {}      # csv_url -> {"ts": float, "rows": List[dict], "raw_sha": str}
-_rl: Dict[str, List[float]] = {}  # rate limit buckets: key/ip -> [timestamps]
+_cache: Dict[str, Dict] = {}
+_rl: Dict[str, List[float]] = {}
 
 # ---------- DB helpers ----------
 def db_conn():
-    """Get a DB connection (Postgres if DATABASE_URL set, else SQLite)."""
     if DB_IS_PG:
         if not HAS_PG:
             raise RuntimeError("psycopg2 not installed; needed for Postgres")
         return psycopg2.connect(DATABASE_URL)
-    # SQLite fallback
     return sqlite3.connect(USAGE_DB)
 
 def db_init():
-    """Create tables if not exist. For Postgres and SQLite."""
     if DB_IS_PG:
         with db_conn() as con:
             cur = con.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usage (
                     api_key TEXT NOT NULL,
-                    period  TEXT NOT NULL, -- 'YYYY-MM'
+                    period  TEXT NOT NULL,
                     count   INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (api_key, period)
                 );
@@ -110,6 +113,16 @@ def db_init():
                     plan TEXT NOT NULL,
                     monthly_limit INTEGER NOT NULL,
                     created_at TEXT NOT NULL
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    session_id  TEXT PRIMARY KEY,
+                    email       TEXT,
+                    plan        TEXT NOT NULL,
+                    api_key     TEXT,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL
                 );
             """)
             con.commit()
@@ -119,7 +132,7 @@ def db_init():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usage (
                     api_key TEXT NOT NULL,
-                    period  TEXT NOT NULL, -- 'YYYY-MM'
+                    period  TEXT NOT NULL,
                     count   INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (api_key, period)
                 )
@@ -132,11 +145,20 @@ def db_init():
                     created_at TEXT NOT NULL
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    session_id  TEXT PRIMARY KEY,
+                    email       TEXT,
+                    plan        TEXT NOT NULL,
+                    api_key     TEXT,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL
+                )
+            """)
             con.commit()
 
 def current_period() -> str:
-    now = datetime.datetime.utcnow()
-    return now.strftime("%Y-%m")
+    return datetime.datetime.utcnow().strftime("%Y-%m")
 
 # ----- Keys (DB or file) -----
 def keys_db_get(api_key: str) -> Optional[Dict]:
@@ -192,13 +214,8 @@ def keys_db_list(limit: int = 1000) -> List[Dict]:
             "SELECT api_key, plan, monthly_limit, created_at FROM keys ORDER BY created_at DESC LIMIT ?"
         cur.execute(q, (limit,))
         rows = cur.fetchall()
-        out = []
-        for r in rows:
-            k, plan, lim, created = r
-            out.append({"api_key": k, "plan": plan, "monthly_limit": int(lim), "created_at": created})
-        return out
+        return [{"api_key": r[0], "plan": r[1], "monthly_limit": int(r[2]), "created_at": r[3]} for r in rows]
 
-# file-mode keys (fallback)
 def load_keys_file() -> Dict[str, Dict]:
     if not os.path.exists(KEYS_PATH):
         return {}
@@ -213,7 +230,6 @@ def issue_key(plan: str, limit_override: Optional[int] = None) -> str:
     plan = plan.lower()
     if plan not in PLANS:
         plan = "free"
-    # generate unique key
     while True:
         k = uuid.uuid4().hex.upper()
         if KEYS_BACKEND == "db":
@@ -237,14 +253,10 @@ def get_limit_for_key(api_key: str) -> int:
         return -1
     if KEYS_BACKEND == "db":
         meta = keys_db_get(api_key)
-        if not meta:
-            return -1
-        return int(meta.get("monthly_limit", 0))
+        return int(meta.get("monthly_limit", 0)) if meta else -1
     else:
         meta = load_keys_file().get(api_key)
-        if not meta:
-            return -1
-        return int(meta.get("monthly_limit", 0))
+        return int(meta.get("monthly_limit", 0)) if meta else -1
 
 def get_plan_for_key(api_key: str) -> Optional[str]:
     if KEYS_BACKEND == "db":
@@ -254,7 +266,7 @@ def get_plan_for_key(api_key: str) -> Optional[str]:
         meta = load_keys_file().get(api_key)
         return (meta or {}).get("plan")
 
-# ----- Usage counters (DB) -----
+# ----- Usage counters -----
 def get_usage(api_key: str, period: Optional[str] = None) -> int:
     period = period or current_period()
     with db_conn() as con:
@@ -269,7 +281,6 @@ def increment_usage(api_key: str, amount: int = 1) -> int:
     period = current_period()
     with db_conn() as con:
         cur = con.cursor()
-        # upsert-ish
         if DB_IS_PG:
             cur.execute("""
                 INSERT INTO usage(api_key, period, count)
@@ -286,7 +297,7 @@ def increment_usage(api_key: str, amount: int = 1) -> int:
         con.commit()
         return int(row[0]) if row else 0
 
-# ---------- Filtering / sorting helpers ----------
+# ---------- Filtering / sorting ----------
 _num_clean_re = re.compile(r"[,\s]")
 _filter_re = re.compile(r"""^\s*(?P<col>[^:~^\$><=!]+?)\s*(?P<op>>=|<=|!=|>|<|~|\^|\$|:)\s*(?P<val>.+?)\s*$""")
 
@@ -308,15 +319,8 @@ def _to_number(s: Optional[str]) -> Optional[float]:
 
 def _match_filter(row_val: Optional[str], op: str, val: str) -> bool:
     if op in (":", "!=", "~", "^", "$"):
-        a = (row_val or "").strip().lower()
-        b = val.strip().lower()
-        return {
-            ":":  a == b,
-            "!=": a != b,
-            "~":  b in a,
-            "^":  a.startswith(b),
-            "$":  a.endswith(b),
-        }[op]
+        a = (row_val or "").strip().lower(); b = val.strip().lower()
+        return {":": a == b, "!=": a != b, "~": b in a, "^": a.startswith(b), "$": a.endswith(b)}[op]
     if op in (">", "<", ">=", "<="):
         x = _to_number(row_val); y = _to_number(val)
         if x is None or y is None: return False
@@ -347,7 +351,7 @@ def validate_csv_url(csv_url: str):
     if "/pub" not in u.path:
         raise HTTPException(status_code=400, detail="csv_url must be a published CSV (path should contain /pub)")
 
-# ---------- CSV fetch (delimiter sniff + size limit + cache) ----------
+# ---------- CSV fetch ----------
 def fetch_csv_rows(csv_url: str, bypass_cache: bool = False) -> Tuple[List[Dict[str, str]], str]:
     now = time.time()
     if not bypass_cache:
@@ -370,7 +374,6 @@ def fetch_csv_rows(csv_url: str, bypass_cache: bool = False) -> Tuple[List[Dict[
         raise HTTPException(status_code=413, detail="CSV too large (>5MB)")
 
     content_text = content_bytes.decode("utf-8", errors="replace")
-
     try:
         sample = content_text[:2048]
         dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
@@ -409,7 +412,7 @@ def apply_filters(rows, select=None, filters=None, order=None, limit=None, offse
     out = out[start:end]
     return out
 
-# ---------- API key enforcement ----------
+# ---------- API key enforcement & rate limiting ----------
 def require_and_track_key(api_key_header: Optional[str], api_key_query: Optional[str]):
     if not REQUIRE_API_KEY:
         return None
@@ -427,19 +430,13 @@ def require_and_track_key(api_key_header: Optional[str], api_key_query: Optional
         raise HTTPException(status_code=429, detail=f"Monthly limit reached ({used_after}/{limit}). Upgrade your plan.")
     return api_key
 
-# ---------- Rate limit helper ----------
 def rate_limit_ok(bucket: str) -> bool:
-    now = time.time()
-    window = 60.0
-    lim = RATE_LIMIT_PER_MIN
+    now = time.time(); window = 60.0; lim = RATE_LIMIT_PER_MIN
     arr = _rl.get(bucket, [])
     arr = [t for t in arr if now - t < window]
     if len(arr) >= lim:
-        _rl[bucket] = arr
-        return False
-    arr.append(now)
-    _rl[bucket] = arr
-    return True
+        _rl[bucket] = arr; return False
+    arr.append(now); _rl[bucket] = arr; return True
 
 def rl_or_429(request: Request, api_key: Optional[str]):
     ident = api_key or (request.client.host if request.client else "unknown")
@@ -511,7 +508,7 @@ HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON —
       <div><label><span class="pill">optional</span> offset</label><input id="offset" type="number" placeholder="0"/></div></div>
       <label><span class="pill">optional</span> filters (one per line)</label>
       <textarea id="filters" placeholder="status:active&#10;name~ali&#10;age&gt;=21&#10;price&lt;100"></textarea>
-      <small class="hint">Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>
+      <small class="hint">Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>
       <div class="row" style="margin-top:8px"><button id="go" type="button">Fetch JSON</button><button id="usage" type="button">Check Usage</button></div>
       <div id="status">Ready.</div><small class="hint">Need a key? <a href="/request-key">Request one</a>.</small></div>
       <div><label>Result</label><pre id="out">Waiting…</pre><label>Curl</label><pre id="curl"># will appear after a request</pre><label>ETag</label><pre id="etag"># returns entity tag for caching</pre></div>
@@ -575,12 +572,12 @@ PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
       <div class="plan"><h3>{PLANS['pro']['label']}</h3>
         <p><strong>{fmt_price(PLANS['pro']['price'])}</strong></p>
         <ul><li>{PLANS['pro']['monthly_limit']} requests / month</li><li>Priority cache & support</li><li>ETag / client caching</li></ul>
-        <div class="cta"><a class="hint" href="/request-key">Request Pro key →</a></div>
+        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and PUBLIC_BASE_URL) else "<div class='hint'>Stripe not configured</div>"}
       </div>
       <div class="plan"><h3>{PLANS['plus']['label']}</h3>
         <p><strong>{fmt_price(PLANS['plus']['price'])}</strong></p>
         <ul><li>{PLANS['plus']['monthly_limit']} requests / month</li><li>Higher limits on demand</li><li>Team usage reporting</li></ul>
-        <div class="cta"><a class="hint" href="/request-key">Request Plus key →</a></div>
+        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (STRIPE_SECRET_KEY and STRIPE_PRICE_PLUS and PUBLIC_BASE_URL) else "<div class='hint'>Stripe not configured</div>"}
       </div>
     </div>
   </div>
@@ -623,7 +620,7 @@ REQUEST_KEY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJ
 </div></body></html>
 """
 
-# ---- /usage page (with safe progress bar) ----
+# /usage page (non-f-string to avoid JS brace issues)
 USAGE_HTML = (
     "<!doctype html><html lang='en'><head>"
     + _html_head("SheetsJSON — Usage")
@@ -655,26 +652,16 @@ USAGE_HTML = (
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
-
-function toNum(x){
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
-
+function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; }
 function setBar(used, limit){
-  const u = toNum(used);
-  const m = Math.max(1, toNum(limit));
+  const u = toNum(used); const m = Math.max(1, toNum(limit));
   let pct = Math.round((u / m) * 100);
-  if (!Number.isFinite(pct) || pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  const el = $("bar"); if (!el) return;
-  el.style.width = pct + "%";
+  if (!Number.isFinite(pct) || pct < 0) pct = 0; if (pct > 100) pct = 100;
+  const el = $("bar"); if (!el) return; el.style.width = pct + "%";
   el.style.background = pct < 70 ? "#55d38a" : (pct < 90 ? "#e9c46a" : "#ef6f6c");
 }
-
 async function run(){
-  const key = $("key").value.trim();
-  if(!key){ $("status").textContent = "Enter your API key."; return; }
+  const key = $("key").value.trim(); if(!key){ $("status").textContent = "Enter your API key."; return; }
   $("status").textContent = "Loading…";
   try{
     const res = await fetch("/v1/usage", { headers: { "x-api-key": key } });
@@ -682,18 +669,11 @@ async function run(){
     try { $("raw").textContent = JSON.stringify(JSON.parse(text), null, 2); } catch { $("raw").textContent = text; }
     if(!res.ok){ $("status").textContent = "HTTP " + res.status; $("summary").style.display="none"; return; }
     const data = JSON.parse(text);
-    const used = Number(data.used ?? 0);
-    const limit = Number(data.limit ?? 0);
-    $("plan").textContent = data.plan || "(unknown)";
-    $("period").textContent = data.period || "";
-    $("numbers").textContent = `${used} of ${limit} requests used`;
-    setBar(used, limit);
-    $("summary").style.display = "block";
-    $("status").textContent = "HTTP " + res.status;
-  }catch(e){
-    $("status").textContent = "Error";
-    $("raw").textContent = "Error: " + e;
-  }
+    const used = Number(data.used ?? 0), limit = Number(data.limit ?? 0);
+    $("plan").textContent = data.plan || "(unknown)"; $("period").textContent = data.period || "";
+    $("numbers").textContent = `${used} of ${limit} requests used`; setBar(used, limit);
+    $("summary").style.display = "block"; $("status").textContent = "HTTP " + res.status;
+  }catch(e){ $("status").textContent = "Error"; $("raw").textContent = "Error: " + e; }
 }
 $("check").addEventListener("click", run);
 </script>
@@ -701,15 +681,12 @@ $("check").addEventListener("click", run);
 """
 )
 
-
-
 PRIVACY_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Privacy Policy")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
   <nav><a href="/">Home</a><a href="/pricing">Pricing & Docs</a><a href="/docs">Swagger</a><a href="/usage">Usage</a></nav>
   <div class="card">
     <h1>Privacy Policy</h1>
-    <p>We only process data you send to the API (public Google Sheets CSV links) to return JSON results. We don’t sell your data.</p>
     <ul>
       <li><strong>Data we store:</strong> API key usage counts (per month), API keys, and key request submissions (name/email/use case).</li>
       <li><strong>Retention:</strong> Usage counts and keys are kept while the service is active. Key requests may be retained for support and abuse prevention.</li>
@@ -727,7 +704,7 @@ TERMS_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON �
   <div class="card">
     <h1>Terms of Service</h1>
     <ul>
-      <li><strong>Acceptable Use:</strong> Don’t abuse the service or attempt to scrape internal networks. Only use published Google Sheets CSV links.</li>
+      <li><strong>Acceptable Use:</strong> Only use published Google Sheets CSV links.</li>
       <li><strong>Rate Limits:</strong> We may throttle or block excessive requests.</li>
       <li><strong>Availability:</strong> Service is provided “as is” without warranty. Free tier may sleep after inactivity.</li>
       <li><strong>Liability:</strong> We’re not liable for lost data or downstream issues caused by your use of this service.</li>
@@ -756,6 +733,7 @@ def privacy_page(): return HTMLResponse(PRIVACY_HTML)
 @app.get("/terms", response_class=HTMLResponse)
 def terms_page(): return HTMLResponse(TERMS_HTML)
 
+# ---------- Key request (demo flow) ----------
 @app.post("/request-key")
 async def request_key_submit(
     request: Request,
@@ -779,7 +757,6 @@ async def request_key_submit(
         "mode": KEY_REQUEST_MODE,
     }
 
-    # store request (file or email)
     if KEY_REQUEST_MODE == "email" and SMTP_HOST and SMTP_USER and SMTP_PASS:
         try:
             msg = EmailMessage()
@@ -795,10 +772,8 @@ async def request_key_submit(
         with open(KEY_REQUEST_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload) + "\n")
 
-    # auto-issue key
     key_text = issue_key(payload["plan"]) if KEY_AUTO_ISSUE else None
 
-    # thank-you page (shows key if issued)
     key_html = (f"<p>Your <strong>{PLANS[payload['plan']]['label']}</strong> API key:</p>"
                 f"<pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{key_text}</pre>"
                 f"<p class='hint'>Limit: {PLANS[payload['plan']]['monthly_limit']} requests / month. "
@@ -814,7 +789,7 @@ async def request_key_submit(
 
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.8.0"}
+def healthz(): return {"ok": True, "version": "0.9.0"}
 
 # ---------- API ----------
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
@@ -830,16 +805,12 @@ def fetch(
     api_key_header: Optional[str] = Header(None, alias="x-api-key", description="Your API key", example="FREE_EXAMPLE_KEY_123"),
     key: Optional[str] = Query(None, description="API key (alt)", example="FREE_EXAMPLE_KEY_123"),
 ):
-    # auth + metering
     api_key = require_and_track_key(api_key_header, key)
     rl_or_429(request, api_key)
-    # safety checks
     validate_csv_url(csv_url)
-    # fetch + transform
     rows, raw_sha = fetch_csv_rows(csv_url, bypass_cache=bool(cache_bypass))
     data = apply_filters(rows, select=select, filters=filter, order=order, limit=limit, offset=offset)
 
-    # ETag
     qnorm = json.dumps({"select": select, "filter": filter, "order": order, "limit": limit, "offset": offset}, sort_keys=True, separators=(",",":"))
     etag = hashlib.sha1((raw_sha + "|" + qnorm + "|" + str(len(data))).encode("utf-8")).hexdigest()
     response.headers["ETag"] = etag
@@ -883,9 +854,7 @@ def admin_keys_page(auth: bool = Depends(admin_guard)):
     if KEYS_BACKEND == "db":
         items = keys_db_list(1000)
     else:
-        items = []
-        for k, meta in load_keys_file().items():
-            items.append({"api_key": k, "plan": meta.get("plan","?"), "monthly_limit": meta.get("monthly_limit","?"), "created_at":"(file)"})
+        items = [{"api_key": k, "plan": v.get("plan","?"), "monthly_limit": v.get("monthly_limit","?"), "created_at":"(file)"} for k,v in load_keys_file().items()]
     rows = []
     for item in items:
         k = item["api_key"]; plan = item["plan"]; lim = item["monthly_limit"]
@@ -944,6 +913,104 @@ def admin_revoke_key(api_key: str = Form(...), auth: bool = Depends(admin_guard)
             del keys[api_key]
             save_keys_file(keys)
     return PlainTextResponse("Revoked (if it existed).\n\nGo back: /admin/keys")
+
+# ---------- Stripe: checkout + success + webhook ----------
+def orders_insert(session_id: str, email: Optional[str], plan: str, api_key: Optional[str], status: str):
+    with db_conn() as con:
+        cur = con.cursor()
+        if DB_IS_PG:
+            q = """INSERT INTO orders(session_id,email,plan,api_key,status,created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (session_id) DO NOTHING"""
+            cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z"))
+        else:
+            q = """INSERT OR IGNORE INTO orders(session_id,email,plan,api_key,status,created_at)
+                   VALUES (?,?,?,?,?,?)"""
+            cur.execute(q, (session_id, email, plan, api_key, status, datetime.datetime.utcnow().isoformat()+"Z"))
+        con.commit()
+
+def orders_get(session_id: str) -> Optional[Dict]:
+    with db_conn() as con:
+        cur = con.cursor()
+        q = "SELECT session_id,email,plan,api_key,status,created_at FROM orders WHERE session_id=%s" if DB_IS_PG else \
+            "SELECT session_id,email,plan,api_key,status,created_at FROM orders WHERE session_id=?"
+        cur.execute(q, (session_id,))
+        row = cur.fetchone()
+        if not row: return None
+        return {"session_id": row[0], "email": row[1], "plan": row[2], "api_key": row[3], "status": row[4], "created_at": row[5]}
+
+@app.post("/billing/checkout", tags=["Billing"])
+def billing_checkout(plan: str = Form(...)):
+    if not SUBSCRIBE_ENABLED:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+    plan = (plan or "").lower()
+    if plan not in ("pro", "plus"):
+        raise HTTPException(status_code=400, detail="Invalid plan")
+    price_id = STRIPE_PRICE_PRO if plan == "pro" else STRIPE_PRICE_PLUS
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            allow_promotion_codes=True,
+            success_url=f"{PUBLIC_BASE_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{PUBLIC_BASE_URL}/pricing",
+            metadata={"plan": plan},
+            automatic_tax={"enabled": True},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
+    return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")
+
+@app.get("/billing/success", response_class=HTMLResponse, tags=["Billing"])
+def billing_success(session_id: str = Query(...)):
+    rec = orders_get(session_id)
+    if rec and rec.get("api_key"):
+        key_html = f"<p>Your <strong>{PLANS[rec['plan']]['label']}</strong> API key:</p><pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{rec['api_key']}</pre><p class='hint'>Stored for {rec.get('email') or '(no email)' }.</p>"
+    else:
+        key_html = "<p>Thanks! We’re finalizing your subscription. This page will show your key as soon as the payment completes—refresh in a few seconds.</p>"
+    return HTMLResponse(f"""<!doctype html><html><head>{_html_head("SheetsJSON — Thanks!")}</head>
+<body><div class="wrap"><div class="card">
+  <h1>Payment successful</h1>
+  {key_html}
+  <p><a class="btn" href="/">Go to Home</a> <a class="btn" style="margin-left:8px" href="/pricing">Docs</a></p>
+</div></div></body></html>""")
+
+@app.post("/stripe/webhook", tags=["Billing"])
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+    payload = await request.body()
+    sig = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook signature error: {e}")
+
+    if event["type"] == "checkout.session.completed":
+        s = event["data"]["object"]
+        session_id = s["id"]
+        plan = ((s.get("metadata") or {}).get("plan") or "pro").lower()
+        email = (s.get("customer_details") or {}).get("email") or s.get("customer_email")
+        existing = orders_get(session_id)
+        if existing and existing.get("api_key"):
+            return {"ok": True}
+        k = issue_key(plan)
+        orders_insert(session_id, email, plan, k, "completed")
+        if SMTP_HOST and SMTP_USER and SMTP_PASS and email:
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = f"Your SheetsJSON {PLANS[plan]['label']} API Key"
+                msg["From"] = SMTP_USER; msg["To"] = email
+                msg.set_content(
+                    f"Thanks for subscribing to SheetsJSON ({plan}).\n\n"
+                    f"Here is your API key:\n\n{k}\n\n"
+                    f"Docs: {PUBLIC_BASE_URL}/pricing\nUsage: {PUBLIC_BASE_URL}/usage\n"
+                )
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s2:
+                    s2.starttls(); s2.login(SMTP_USER, SMTP_PASS); s2.send_message(msg)
+            except Exception:
+                pass
+    return {"ok": True}
 
 # ---------- Startup ----------
 @app.on_event("startup")

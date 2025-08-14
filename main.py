@@ -1149,6 +1149,19 @@ def billing_checkout(plan: str = Form(...)):
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
     return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")
 
+@app.post("/billing/portal", tags=["Billing"])
+def billing_portal(session_id: str = Form(...)):
+    if not SUBSCRIBE_ENABLED:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+    rec = orders_get(session_id)
+    if not rec or not rec.get("customer_id"):
+        raise HTTPException(status_code=404, detail="Order not found or missing customer")
+    sess = stripe.billing_portal.Session.create(
+        customer=rec["customer_id"],
+        return_url=f"{PUBLIC_BASE_URL}/pricing"
+    )
+    return HTMLResponse(f'<!doctype html><meta charset="utf-8"><script>location.href="{sess.url}";</script>')
+
 @app.get("/billing/success", response_class=HTMLResponse, tags=["Billing"])
 def billing_success(session_id: str = Query(...)):
     rec = orders_get(session_id)
@@ -1160,8 +1173,14 @@ def billing_success(session_id: str = Query(...)):
 <body><div class="wrap"><div class="card">
   <h1>Payment successful</h1>
   {key_html}
-  <p><a class="btn" href="/">Go to Home</a> <a class="btn" style="margin-left:8px" href="/pricing">Docs</a></p>
+  <form method="post" action="/billing/portal" style="display:inline">
+    <input type="hidden" name="session_id" value="{session_id}"/>
+    <button class="btn" type="submit">Manage billing</button>
+  </form>
+  <a class="btn" style="margin-left:8px" href="/">Go to Home</a>
+  <a class="btn" style="margin-left:8px" href="/pricing">Docs</a>
 </div></div></body></html>""")
+
 
 @app.post("/stripe/webhook", tags=["Billing"])
 async def stripe_webhook(request: Request):

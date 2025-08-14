@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response as FastAPIResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.middleware.base import BaseHTTPMiddleware
 from uvicorn import run as uvicorn_run
 
 import sqlite3
@@ -19,16 +20,26 @@ except Exception:
 
 import stripe
 
+# ---------- Optional: Sentry ----------
+SENTRY_DSN = os.getenv("SENTRY_DSN","").strip()
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.05)
+    except Exception:
+        pass
+
 # ---------- App ----------
 app = FastAPI(
     title="SheetsJSON",
-    version="0.11.0",
+    version="0.12.0",
     openapi_tags=[
         {"name": "API", "description": "Convert Google Sheets CSV → JSON"},
         {"name": "Account", "description": "Usage & limits"},
         {"name": "Admin", "description": "Key management"},
         {"name": "Billing", "description": "Stripe checkout & webhook"},
         {"name": "Pages", "description": "Public pages"},
+        {"name": "SEO", "description": "Robots & sitemap"},
     ],
 )
 app.add_middleware(GZipMiddleware)
@@ -86,8 +97,10 @@ SUBSCRIBE_ENABLED = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_PRO and STRIPE_PRICE
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
-# --- Analytics / host info ---
+# --- Analytics / host info & SEO tokens ---
 PLAUSIBLE_DOMAIN = os.getenv("PLAUSIBLE_DOMAIN", "").strip()
+GOOGLE_SITE_VERIFICATION = os.getenv("GOOGLE_SITE_VERIFICATION","").strip()
+
 PUBLIC_HOST = ""
 try:
     if PUBLIC_BASE_URL:
@@ -98,8 +111,34 @@ except Exception:
 def _analytics_snippet() -> str:
     if not PLAUSIBLE_DOMAIN:
         return ""
-    # Plausible: privacy-friendly, no cookies
     return f'<script defer data-domain="{PLAUSIBLE_DOMAIN}" src="https://plausible.io/js/script.js"></script>'
+
+def _google_verify_snippet() -> str:
+    if not GOOGLE_SITE_VERIFICATION:
+        return ""
+    # token only; meta name/value added here
+    return f'<meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}"/>'
+
+# ---------- Security headers ----------
+class SecurityHeaders(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        resp = await call_next(request)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        resp.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+        if PLAUSIBLE_DOMAIN:
+            resp.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "img-src 'self' data:; "
+                "style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' https://plausible.io; "
+                "connect-src 'self';"
+            )
+        return resp
+
+app.add_middleware(SecurityHeaders)
 
 # ---------- In-memory cache & rate limit ----------
 _cache: Dict[str, Dict] = {}
@@ -178,7 +217,7 @@ def db_init():
                 )
             """)
             con.commit()
-        # SQLite safe add (older dbs)
+        # SQLite: add columns if missing
         try:
             with db_conn() as con:
                 cur = con.cursor()
@@ -378,11 +417,11 @@ def validate_csv_url(csv_url: str):
     if u.scheme != "https":
         raise HTTPException(status_code=400, detail="csv_url must be https")
 
-    # Allow our own demo CSV endpoints (e.g., https://yourdomain/demo/csv/1)
+    # Allow our own demo CSV endpoints
     if PUBLIC_HOST and u.netloc == PUBLIC_HOST and u.path.startswith("/demo/csv/"):
         return
 
-    # Default: only allow published Google Sheets CSV
+    # Only allow published Google Sheets CSV
     if not (u.netloc.endswith("docs.google.com")):
         raise HTTPException(status_code=400, detail="Only Google Sheets 'Publish to web → CSV' links are allowed")
     if "/pub" not in u.path:
@@ -505,8 +544,10 @@ def favicon_svg():
 
 # ---------- Shared HTML head ----------
 def _html_head(title: str) -> str:
+    # canonical cannot include path without request, so we keep it generic
     return f"""
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+{_google_verify_snippet()}
 <title>{title}</title><link rel="icon" href="/favicon.svg">
 {_analytics_snippet()}
 <style>
@@ -551,7 +592,7 @@ HOME_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON —
       <label><span class="pill">optional</span> filters (one per line)</label>
       <textarea id="filters" placeholder="status:active&#10;name~ali&#10;age&gt;=21&#10;price&lt;100"></textarea>
       <small class="hint">Supported: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>, numeric <code>col&gt;=num</code>/<code>&lt;=</code>/<code>&gt;</code>/<code>&lt;</code>. Add <code>cache_bypass=1</code> in query to refetch.</small>
-      <div class="row" style="margin-top:8px"><button id="go" type="button">Fetch JSON</button><button id="usage" type="button">Check Usage</button></div>
+      <div class="row" style="margin-top:8px"><button id="go" type="button" onclick="window.plausible && plausible('FetchClicked')">Fetch JSON</button><button id="usage" type="button">Check Usage</button></div>
       <div id="status">Ready.</div><small class="hint">Need a key? <a href="/request-key">Request one</a>. See <a href="/examples">Examples</a>.</small></div>
       <div><label>Result</label><pre id="out">Waiting…</pre><label>Curl</label><pre id="curl"># will appear after a request</pre><label>ETag</label><pre id="etag"># returns entity tag for caching</pre></div>
     </div>
@@ -609,6 +650,7 @@ prefillFromQuery();
 def fmt_price(n: int) -> str:
     return "$0" if n == 0 else f"${n}/mo"
 
+# Pricing with Plausible submit events + quick examples
 PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — Pricing & Docs")}</head>
 <body><div class="wrap">
   <header><img src="/logo.svg" alt="SheetsJSON logo" style="width:36px;height:36px;margin-right:8px"/><strong>SheetsJSON</strong></header>
@@ -623,12 +665,12 @@ PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
       <div class="plan"><h3>{PLANS['pro']['label']}</h3>
         <p><strong>{fmt_price(PLANS['pro']['price'])}</strong></p>
         <ul><li>{PLANS['pro']['monthly_limit']} requests / month</li><li>Priority cache & support</li><li>ETag / client caching</li></ul>
-        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
+        {"<form method='post' action='/billing/checkout' onsubmit=\\"window.plausible && plausible('CheckoutStart', {props:{plan:'pro'}})\\"><input type='hidden' name='plan' value='pro'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
       </div>
       <div class="plan"><h3>{PLANS['plus']['label']}</h3>
         <p><strong>{fmt_price(PLANS['plus']['price'])}</strong></p>
         <ul><li>{PLANS['plus']['monthly_limit']} requests / month</li><li>Higher limits on demand</li><li>Team usage reporting</li></ul>
-        {"<form method='post' action='/billing/checkout'><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
+        {"<form method='post' action='/billing/checkout' onsubmit=\\"window.plausible && plausible('CheckoutStart', {props:{plan:'plus'}})\\"><input type='hidden' name='plan' value='plus'/><button class='btn' type='submit'>Subscribe</button></form>" if (SUBSCRIBE_ENABLED) else "<div class='hint'>Stripe not configured</div>"}
       </div>
     </div>
   </div>
@@ -642,7 +684,17 @@ PRICING_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON 
       <li><code>order</code>: string <code>col</code> or numeric <code>col:num</code> (desc with <code>-</code>)</li>
       <li><code>limit</code>, <code>offset</code>; <code>cache_bypass=1</code> to refetch</li>
     </ul>
-    <p>Interactive docs at <a href="/docs">/docs</a></p>
+    <h3>Quick examples</h3>
+    <pre>curl -H "x-api-key: YOUR_KEY" "{PUBLIC_BASE_URL}/v1/fetch?csv_url=...&filter=status:active&order=-price:num&limit=50"</pre>
+    <pre>// Node
+// npm i node-fetch
+import fetch from 'node-fetch';
+const res = await fetch('{PUBLIC_BASE_URL}/v1/fetch?csv_url=...', {{ headers: {{'x-api-key':'YOUR_KEY'}} }});
+const data = await res.json();</pre>
+    <pre># Python
+import requests
+r = requests.get('{PUBLIC_BASE_URL}/v1/fetch', params={{'csv_url':'...'}}, headers={{'x-api-key':'YOUR_KEY'}})
+print(r.json())</pre>
   </div>
 </div></body></html>
 """
@@ -803,14 +855,16 @@ FAQ_HTML = f"""<!doctype html><html lang="en"><head>{_html_head("SheetsJSON — 
     <p>No sheet data is stored. We keep API keys and monthly usage counts. See <a href="/privacy">Privacy</a>.</p>
     <h3>How do filters work?</h3>
     <p>String: <code>col:value</code>, <code>col!=v</code>, <code>col~v</code>, <code>col^v</code>, <code>col$v</code>.<br/>Numeric: <code>col&gt;=n</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&lt;</code>. Sort: <code>order=price:num</code> or <code>-price:num</code>. Select columns with <code>select=col1,col2</code>.</p>
+    <h3>How do I publish to CSV?</h3>
+    <ol>
+      <li>Open your Google Sheet → File → <strong>Share</strong> → <strong>Publish to web</strong>.</li>
+      <li>Select the sheet/tab, choose <strong>CSV</strong>, and click <strong>Publish</strong>.</li>
+      <li>Ensure the link contains <code>/pub</code> and <code>output=csv</code>, then paste it on the Home page.</li>
+    </ol>
     <h3>Is there caching?</h3>
     <p>Yes. Server caches CSV for <code>CACHE_TTL_SECONDS</code> (default 300s). Client ETag supported—send <code>If-None-Match</code> to skip body.</p>
     <h3>What are limits?</h3>
     <p>Free: {PLANS['free']['monthly_limit']}/mo. Pro: {PLANS['pro']['monthly_limit']}/mo. Plus: {PLANS['plus']['monthly_limit']}/mo.</p>
-    <h3>Why is my CSV not accepted?</h3>
-    <p>Ensure it’s <code>https://docs.google.com/.../pub?output=csv</code>. If you see “must include output=csv” or “/pub missing”, republish correctly.</p>
-    <h3>Can I use GitHub raw CSV?</h3>
-    <p>For security, production API only allows Google Sheets. Use the demo datasets for testing.</p>
   </div>
 </div></body></html>
 """
@@ -930,9 +984,21 @@ async def request_key_submit(
   <p><a style='color:#9cc2ff' href='/'>← Back to Home</a></p>
 </body>""", status_code=200)
 
+# ---------- SEO: robots & sitemap ----------
+@app.get("/robots.txt", response_class=PlainTextResponse, tags=["SEO"])
+def robots():
+    return PlainTextResponse(f"User-agent: *\nAllow: /\nSitemap: {PUBLIC_BASE_URL}/sitemap.xml\n")
+
+@app.get("/sitemap.xml", tags=["SEO"])
+def sitemap():
+    urls = ["/", "/examples", "/pricing", "/usage", "/faq", "/privacy", "/terms"]
+    items = "".join(f"<url><loc>{PUBLIC_BASE_URL}{p}</loc></url>" for p in urls if PUBLIC_BASE_URL)
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{items}</urlset>'
+    return FastAPIResponse(content=xml, media_type="application/xml")
+
 # ---------- Health ----------
 @app.get("/healthz")
-def healthz(): return {"ok": True, "version": "0.11.0"}
+def healthz(): return {"ok": True, "version": "0.12.0"}
 
 # ---------- API ----------
 @app.get("/v1/fetch", tags=["API"], description="Paste a Google Sheets **Publish to web → CSV** link.")
@@ -1149,6 +1215,7 @@ def billing_checkout(plan: str = Form(...)):
         raise HTTPException(status_code=400, detail=f"Stripe error: {e}")
     return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><script>location.href="{session.url}";</script>""")
 
+# Customer Portal (Manage billing)
 @app.post("/billing/portal", tags=["Billing"])
 def billing_portal(session_id: str = Form(...)):
     if not SUBSCRIBE_ENABLED:
@@ -1169,6 +1236,7 @@ def billing_success(session_id: str = Query(...)):
         key_html = f"<p>Your <strong>{PLANS[rec['plan']]['label']}</strong> API key:</p><pre style='background:#0a0f24;border:1px solid #26335f;border-radius:8px;padding:12px'>{rec['api_key']}</pre><p class='hint'>Stored for {rec.get('email') or '(no email)' }.</p>"
     else:
         key_html = "<p>Thanks! We’re finalizing your subscription. This page will show your key as soon as the payment completes—refresh in a few seconds.</p>"
+    plan_js = (rec.get("plan","") if rec else "")
     return HTMLResponse(f"""<!doctype html><html><head>{_html_head("SheetsJSON — Thanks!")}</head>
 <body><div class="wrap"><div class="card">
   <h1>Payment successful</h1>
@@ -1179,8 +1247,13 @@ def billing_success(session_id: str = Query(...)):
   </form>
   <a class="btn" style="margin-left:8px" href="/">Go to Home</a>
   <a class="btn" style="margin-left:8px" href="/pricing">Docs</a>
-</div></div></body></html>""")
-
+</div></div>
+<script>
+  if (window.plausible) {{
+    plausible('SubscribeSuccess', {{props: {{plan: '{plan_js}'}}}});
+  }}
+</script>
+</body></html>""")
 
 @app.post("/stripe/webhook", tags=["Billing"])
 async def stripe_webhook(request: Request):

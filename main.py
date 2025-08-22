@@ -579,6 +579,275 @@ def _html_head(title: str) -> str:
 </style>"""
     )
 
+# ---------- Embed generator page ----------
+@app.get("/embed", response_class=HTMLResponse, tags=["Pages"])
+def embed_generator():
+    head = _html_head("SheetsJSON — Embed Generator")
+    return HTMLResponse(
+        "<!doctype html><html><head>"+head+"</head><body><div class='wrap'>"
+        "<header><img src='/logo.svg' alt='SheetsJSON logo' style='width:36px;height:36px;margin-right:8px'/>"
+        "<strong>SheetsJSON</strong></header>"
+        "<nav><a href='/'>Home</a><a href='/examples'>Examples</a><a href='/pricing'>Pricing & Docs</a>"
+        "<a href='/docs'>Swagger</a><a href='/usage'>Usage</a><a href='/faq'>FAQ</a><a href='/embed'>Embed</a></nav>"
+        "<div class='card'><h1>Embed a Google Sheet as a table</h1>"
+        "<p>Publish your Sheet to CSV, then paste the URL and options. Copy the snippet into Webflow/Framer/any site.</p>"
+        "<label>Published CSV URL</label><input id='csv' placeholder='https://docs.google.com/.../pub?output=csv'/>"
+        "<div class='row'><div><label>API key</label><input id='key' placeholder='YOUR_API_KEY'/></div>"
+        "<div><label>Page size</label><input id='page' type='number' value='10'/></div></div>"
+        "<div class='row'><div><label>Select columns (comma)</label><input id='select' placeholder='name,price,status'/></div>"
+        "<div><label>Default order</label><input id='order' placeholder='-price:num'/></div></div>"
+        "<label>Filters (separate multiple with ;)</label><input id='filters' placeholder='status:active;price<20'/>"
+        "<div class='row'><div><label>Theme</label><select id='theme'><option>auto</option><option>light</option><option>dark</option></select></div>"
+        "<div><label>Max rows to fetch</label><input id='limit' type='number' value='500'/></div></div>"
+        "<div style='margin-top:8px'><button id='gen' type='button'>Generate snippet</button></div>"
+        "</div>"
+        "<div class='card' style='margin-top:14px'><h2>Snippet</h2><pre id='out'>&lt;!-- fill the form and click Generate --&gt;</pre></div>"
+        "</div><script>"
+        "const $=id=>document.getElementById(id);"
+        "document.getElementById('gen').addEventListener('click',()=>{"
+        " const csv=$('csv').value.trim(); const key=$('key').value.trim();"
+        " if(!csv){$('out').textContent='// Add a CSV URL first'; return;}"
+        " const attrs=[];"
+        " attrs.push(`data-csv=\"${csv.replace(/\"/g,'&quot;')}\"`);"
+        " if(key) attrs.push(`data-key=\"${key.replace(/\"/g,'&quot;')}\"`);"
+        " const sel=$('select').value.trim(); if(sel) attrs.push(`data-select=\"${sel}\"`);"
+        " const ord=$('order').value.trim(); if(ord) attrs.push(`data-order=\"${ord}\"`);"
+        " const fil=$('filters').value.trim(); if(fil) attrs.push(`data-filters=\"${fil}\"`);"
+        " const page=$('page').value.trim(); if(page) attrs.push(`data-page=\"${page}\"`);"
+        " const limit=$('limit').value.trim(); if(limit) attrs.push(`data-limit=\"${limit}\"`);"
+        " const theme=$('theme').value.trim(); if(theme) attrs.push(`data-theme=\"${theme}\"`);"
+        " const div = `<div class=\"sj-table\" ${attrs.join(' ')}></div>`;"
+        " const scr = `<script src=\""+(PUBLIC_BASE_URL or '')+"/embed.js\" async></`+\"script>`;"
+        " $('out').textContent = div + '\\n' + scr;"
+        "});"
+        "</script></body></html>"
+    )
+
+# ---------- Embeddable JS (renders a searchable/sortable table) ----------
+@app.get("/embed.js", tags=["Pages"])
+def embed_js():
+    js = r"""
+(function(){
+  'use strict';
+
+  // Ready helper
+  function onReady(fn){ if(document.readyState!=='loading'){fn()} else {document.addEventListener('DOMContentLoaded', fn);} }
+
+  // Escape HTML
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;' }[m])); }
+
+  // Parse numbers for sorting
+  function toNum(v){
+    if (v == null) return null;
+    let t = String(v).trim();
+    if (!t) return null;
+    if (t[0] === '$') t = t.slice(1);
+    const pct = t.endsWith('%');
+    if (pct) t = t.slice(0, -1);
+    t = t.replace(/[, \t]/g,'');
+    const n = parseFloat(t);
+    if (!isFinite(n)) return null;
+    return pct ? n/100 : n;
+  }
+
+  // Style injection (scoped by classes)
+  function ensureStyles(){
+    if (document.getElementById('sj-embed-css')) return;
+    const css = `
+.sj-wrap{font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto;color:#eaf0ff}
+.sj-theme-light .sj-wrap{color:#0c1633}
+.sj-box{background:#0e1630;border:1px solid #233366;border-radius:12px;padding:10px;overflow:auto}
+.sj-theme-light .sj-box{background:#f7f9ff;border-color:#d6e0ff}
+.sj-controls{display:flex;gap:8px;align-items:center;margin:6px 0 10px}
+.sj-search{flex:1 1 auto;padding:8px 10px;border-radius:8px;border:1px solid #26335f;background:#0a0f24;color:inherit}
+.sj-theme-light .sj-search{background:#fff;border-color:#ccd6ff}
+.sj-select{padding:6px 10px;border-radius:8px;border:1px solid #26335f;background:#0a0f24;color:inherit}
+.sj-theme-light .sj-select{background:#fff;border-color:#ccd6ff}
+.sj-table-el{width:100%;border-collapse:collapse}
+.sj-th,.sj-td{padding:8px 10px;border-bottom:1px solid #233366;text-align:left;vertical-align:top}
+.sj-theme-light .sj-th,.sj-theme-light .sj-td{border-bottom-color:#dbe4ff}
+.sj-th{user-select:none;cursor:pointer;white-space:nowrap}
+.sj-sort{opacity:.7;margin-left:6px;font-size:11px}
+.sj-pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:8px}
+.sj-btn{padding:6px 10px;border-radius:8px;border:1px solid #233366;background:#0e1630;color:inherit;cursor:pointer}
+.sj-theme-light .sj-btn{background:#f7f9ff;border-color:#d6e0ff}
+.sj-btn[disabled]{opacity:.5;cursor:not-allowed}
+.sj-small{font-size:12px;opacity:.8}
+.sj-loading,.sj-error{padding:8px 10px}
+`;
+    const el = document.createElement('style'); el.id='sj-embed-css'; el.textContent=css; document.head.appendChild(el);
+  }
+
+  // Find script origin for API base
+  function scriptOrigin(){
+    const cand = document.currentScript || document.querySelector('script[src*="/embed.js"]');
+    try { return cand ? (new URL(cand.src)).origin : window.location.origin; } catch(e){ return window.location.origin; }
+  }
+
+  // Build table component inside a container with data-* attributes
+  function initContainer(container){
+    const d = container.dataset;
+    const csv = (d.csv||'').trim();
+    if(!csv){ container.innerHTML = "<div class='sj-error'>Missing <code>data-csv</code></div>"; return; }
+    const key = (d.key||'').trim();
+    const select = (d.select||'').trim();
+    const order = (d.order||'').trim();
+    const filters = (d.filters||'').trim(); // separate multiple with ';'
+    const pageSize = Math.max(1, parseInt(d.page||'10',10));
+    const limit = Math.max(pageSize, parseInt(d.limit||'500',10)); // max rows to fetch
+    const theme = (d.theme||'auto');
+
+    // UI shell
+    ensureStyles();
+    const wrap = document.createElement('div');
+    wrap.className = 'sj-wrap ' + (theme==='dark'?'sj-theme-dark':(theme==='light'?'sj-theme-light':(matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? 'sj-theme-dark':'sj-theme-light')));
+    const box = document.createElement('div'); box.className='sj-box';
+    const controls = document.createElement('div'); controls.className='sj-controls';
+    const search = document.createElement('input'); search.className='sj-search'; search.placeholder='Search…'; search.setAttribute('aria-label','Search');
+    controls.appendChild(search);
+    const table = document.createElement('table'); table.className='sj-table-el';
+    const thead = document.createElement('thead'); const tbody = document.createElement('tbody');
+    table.appendChild(thead); table.appendChild(tbody);
+    const pager = document.createElement('div'); pager.className='sj-pager';
+    const prev = document.createElement('button'); prev.className='sj-btn'; prev.textContent='Prev';
+    const next = document.createElement('button'); next.className='sj-btn'; next.textContent='Next';
+    const info = document.createElement('span'); info.className='sj-small';
+    pager.appendChild(prev); pager.appendChild(next); pager.appendChild(info);
+    box.appendChild(controls); box.appendChild(table); box.appendChild(pager);
+    container.innerHTML=''; container.appendChild(wrap); wrap.appendChild(box);
+
+    // State
+    let rows = []; let view = []; let cols = []; let sortCol = null; let sortDir = 1; let sortNumeric = false;
+    let page = 1;
+
+    function setInfo(){
+      const total = view.length; const pages = Math.max(1, Math.ceil(total / pageSize));
+      if(page>pages) page = pages;
+      info.textContent = total ? ("Page "+page+" / "+pages+" • "+total+" rows") : "No rows";
+      prev.disabled = (page<=1); next.disabled = (page>=pages);
+    }
+
+    function detectNumeric(col){
+      for(const r of view){ const v = toNum(r[col]); if(v!=null) return true; }
+      return false;
+    }
+
+    function renderHead(){
+      const tr = document.createElement('tr');
+      cols.forEach(c=>{
+        const th = document.createElement('th'); th.className='sj-th'; th.textContent=c;
+        const s = document.createElement('span'); s.className='sj-sort'; s.textContent = c===sortCol ? (sortDir>0?'▲':'▼') : '↕';
+        th.appendChild(s);
+        th.addEventListener('click', ()=>{
+          if(sortCol===c){ sortDir = -sortDir; } else { sortCol=c; sortDir=1; sortNumeric = detectNumeric(c); }
+          sortView(); renderBody(); renderHead();
+        });
+        tr.appendChild(th);
+      });
+      thead.innerHTML=''; thead.appendChild(tr);
+    }
+
+    function rowMatchesSearch(r, q){
+      if(!q) return true;
+      const needle = q.toLowerCase();
+      for(const c of cols){
+        const v = (r[c]==null?'':String(r[c])).toLowerCase();
+        if(v.includes(needle)) return true;
+      }
+      return false;
+    }
+
+    function sortView(){
+      if(!sortCol) return;
+      view.sort((a,b)=>{
+        const A = a[sortCol], B = b[sortCol];
+        if(sortNumeric){
+          const x = toNum(A), y = toNum(B);
+          if(x==null && y==null) return 0;
+          if(x==null) return -1*sortDir;
+          if(y==null) return 1*sortDir;
+          return (x<y?-1:(x>y?1:0))*sortDir;
+        } else {
+          const x = (A==null?'':String(A)).toLowerCase();
+          const y = (B==null?'':String(B)).toLowerCase();
+          return (x<y?-1:(x>y?1:0))*sortDir;
+        }
+      });
+    }
+
+    function renderBody(){
+      const total = view.length; const pages = Math.max(1, Math.ceil(total / pageSize));
+      if(page>pages) page = pages;
+      const start = (page-1)*pageSize, end = Math.min(start+pageSize, total);
+      const frag = document.createDocumentFragment();
+      for(let i=start;i<end;i++){
+        const r = view[i]; const tr = document.createElement('tr');
+        cols.forEach(c=>{ const td=document.createElement('td'); td.className='sj-td'; td.innerHTML=esc(r[c]??''); tr.appendChild(td); });
+        frag.appendChild(tr);
+      }
+      tbody.innerHTML=''; tbody.appendChild(frag);
+      setInfo();
+    }
+
+    // Wire events
+    search.addEventListener('input', ()=>{
+      const q = search.value.trim();
+      view = rows.filter(r=>rowMatchesSearch(r,q));
+      sortView(); page = 1; renderBody();
+    });
+    prev.addEventListener('click', ()=>{ if(page>1){ page--; renderBody(); } });
+    next.addEventListener('click', ()=>{ const pages=Math.max(1,Math.ceil(view.length/pageSize)); if(page<pages){ page++; renderBody(); } });
+
+    // Fetch data
+    (async function(){
+      const base = scriptOrigin();
+      const u = new URL(base + "/v1/fetch");
+      u.searchParams.set("csv_url", csv);
+      if (select) u.searchParams.set("select", select);
+      if (order) u.searchParams.set("order", order);
+      if (limit) u.searchParams.set("limit", String(limit));
+      if (filters){
+        filters.split(';').map(s=>s.trim()).filter(Boolean).forEach(f=>u.searchParams.append("filter", f));
+      }
+      // Loading state
+      container.querySelector('.sj-box').insertAdjacentHTML('afterbegin', "<div class='sj-loading'>Loading…</div>");
+      const loadingEl = container.querySelector('.sj-loading');
+      try{
+        const headers = key ? {"x-api-key": key} : {};
+        const res = await fetch(u.toString(), { headers });
+        const text = await res.text();
+        if(!res.ok){ throw new Error("HTTP "+res.status+" "+text); }
+        let data; try{ data = JSON.parse(text); } catch{ data = { rows: [] }; }
+        rows = (data && (data.rows || data.data)) || [];
+        // Columns
+        if (select){
+          cols = select.split(',').map(s=>s.trim()).filter(Boolean);
+        } else {
+          cols = rows.length ? Object.keys(rows[0]) : [];
+        }
+        // Default sort from 'order' (e.g., -price:num)
+        if(order){
+          let o = order.trim(); sortDir = 1; if(o.startsWith('-')){ sortDir=-1; o=o.slice(1); }
+          if(o.endsWith(':num')){ sortNumeric=true; o=o.slice(0,-4); } else { sortNumeric=false; }
+          sortCol = o;
+        }
+        view = rows.slice(0);
+        sortView(); renderHead(); renderBody();
+      }catch(e){
+        container.innerHTML = "<div class='sj-error'>"+esc(e.message||String(e))+"</div>";
+      } finally {
+        if (loadingEl && loadingEl.remove) loadingEl.remove();
+      }
+    })();
+  }
+
+  onReady(function(){
+    document.querySelectorAll('.sj-table,[data-csv]').forEach(initContainer);
+  });
+})();
+"""
+    return FastAPIResponse(content=js, media_type="application/javascript")
+
 # ---------- Pages ----------
 def _home_html() -> str:
     return (

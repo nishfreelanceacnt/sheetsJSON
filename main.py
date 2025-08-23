@@ -324,7 +324,10 @@ def issue_key(plan: str, limit_override: Optional[int] = None) -> str:
     return k
 
 def get_limit_for_key(api_key: str) -> int:
-    """Return the effective monthly limit for a key, auto-correcting it to the plan default if needed."""
+    """
+    Return the effective monthly limit for a key without mutating storage.
+    We compute max(stored_limit, plan_default) and DO NOT write to DB/file here.
+    """
     if not api_key:
         return -1
 
@@ -336,34 +339,15 @@ def get_limit_for_key(api_key: str) -> int:
         meta = keys_db_get(api_key)
         if not meta:
             return -1
-        p = (meta.get("plan") or "free").lower()
         stored = int(meta.get("monthly_limit") or 0)
-        target = plan_default(p)
-        effective = max(stored, target)
-        if effective != stored:
-            try:
-                keys_db_update(api_key, monthly_limit=effective)
-            except Exception:
-                pass
-        return effective
+        return max(stored, plan_default(meta.get("plan")))
     else:
-        # file backend
         keys = load_keys_file()
         meta = keys.get(api_key)
         if not meta:
             return -1
-        p = (meta.get("plan") or "free").lower()
         stored = int(meta.get("monthly_limit") or 0)
-        target = plan_default(p)
-        effective = max(stored, target)
-        if effective != stored:
-            meta["monthly_limit"] = effective
-            try:
-                save_keys_file(keys)
-            except Exception:
-                pass
-        return effective
-
+        return max(stored, plan_default(meta.get("plan")))
 
 def get_plan_for_key(api_key: str) -> Optional[str]:
     if KEYS_BACKEND == "db":

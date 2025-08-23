@@ -324,39 +324,42 @@ def issue_key(plan: str, limit_override: Optional[int] = None) -> str:
     return k
 
 def get_limit_for_key(api_key: str) -> int:
-    """Return the effective monthly limit for a key, auto-correcting if it's below the plan default."""
+    """Return the effective monthly limit for a key, auto-correcting it to the plan default if needed."""
     if not api_key:
         return -1
+
+    def plan_default(plan: str) -> int:
+        p = (plan or "free").lower()
+        return int(PLANS.get(p, PLANS["free"])["monthly_limit"])
 
     if KEYS_BACKEND == "db":
         meta = keys_db_get(api_key)
         if not meta:
             return -1
-        plan = (meta.get("plan") or "free").lower()
+        p = (meta.get("plan") or "free").lower()
         stored = int(meta.get("monthly_limit") or 0)
-        default_for_plan = int(PLANS.get(plan, PLANS["free"])["monthly_limit"])
-        # If stored value is below the plan's default, bump it up and persist
-        effective = max(stored, default_for_plan)
+        target = plan_default(p)
+        effective = max(stored, target)
         if effective != stored:
             try:
                 keys_db_update(api_key, monthly_limit=effective)
             except Exception:
-                pass  # non-fatal: still return effective
+                pass
         return effective
     else:
         # file backend
-        all_keys = load_keys_file()
-        meta = all_keys.get(api_key)
+        keys = load_keys_file()
+        meta = keys.get(api_key)
         if not meta:
             return -1
-        plan = (meta.get("plan") or "free").lower()
+        p = (meta.get("plan") or "free").lower()
         stored = int(meta.get("monthly_limit") or 0)
-        default_for_plan = int(PLANS.get(plan, PLANS["free"])["monthly_limit"])
-        effective = max(stored, default_for_plan)
+        target = plan_default(p)
+        effective = max(stored, target)
         if effective != stored:
             meta["monthly_limit"] = effective
             try:
-                save_keys_file(all_keys)
+                save_keys_file(keys)
             except Exception:
                 pass
         return effective
